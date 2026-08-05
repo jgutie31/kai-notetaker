@@ -45,6 +45,13 @@ fn start_recording(app: tauri::AppHandle, state: State<RecordingState>) -> Resul
     Ok(())
 }
 
+#[tauri::command]
+fn switch_recording_device(device_name: String, state: State<RecordingState>) -> Result<(), String> {
+    let mut guard = state.0.lock().map_err(|_| "recording state lock poisoned")?;
+    let (session, _) = guard.as_mut().ok_or("no recording in progress")?;
+    session.switch_device(&device_name).map_err(|e| e.to_string())
+}
+
 #[derive(serde::Serialize)]
 struct StopRecordingResult {
     path: String,
@@ -85,6 +92,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             list_audio_devices,
             start_recording,
+            switch_recording_device,
             stop_recording
         ])
         .setup(|app| {

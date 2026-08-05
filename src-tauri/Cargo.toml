@@ -34,6 +34,7 @@ sherpa-onnx = "1.13.4"
 llama-cpp-2 = { version = "0.1.154", features = ["metal"] }
 encoding_rs = "0.8"
 reqwest = { version = "0.12", features = ["blocking", "json"] }
+rubato = "4.0"
 
 [dev-dependencies]
 tempfile = "3"

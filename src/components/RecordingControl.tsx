@@ -26,6 +26,7 @@ export function RecordingControl() {
   const [error, setError] = useState<string | null>(null);
   const [lastSaved, setLastSaved] = useState<StopRecordingResult | null>(null);
   const [isBusy, setIsBusy] = useState(false);
+  const [isSwitchingDevice, setIsSwitchingDevice] = useState(false);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
@@ -72,6 +73,27 @@ export function RecordingControl() {
     }
   }, [isRecording]);
 
+  const handleDeviceChange = useCallback(
+    async (newDeviceName: string) => {
+      const previous = selectedDevice;
+      setSelectedDevice(newDeviceName);
+
+      if (!isRecording) return;
+
+      setIsSwitchingDevice(true);
+      setError(null);
+      try {
+        await invoke("switch_recording_device", { deviceName: newDeviceName });
+      } catch (e) {
+        setError(String(e));
+        setSelectedDevice(previous); // revert on failure — the old stream is still live
+      } finally {
+        setIsSwitchingDevice(false);
+      }
+    },
+    [isRecording, selectedDevice],
+  );
+
   const noDevices = devices.length === 0;
 
   return (
@@ -82,8 +104,8 @@ export function RecordingControl() {
           <select
             id="device-select"
             value={selectedDevice}
-            onChange={(e) => setSelectedDevice(e.target.value)}
-            disabled={isRecording || noDevices}
+            onChange={(e) => handleDeviceChange(e.target.value)}
+            disabled={noDevices || isSwitchingDevice}
           >
             {noDevices && <option>No input device found</option>}
             {devices.map((d) => (
@@ -104,6 +126,7 @@ export function RecordingControl() {
             <path d="M1 1L5 5L9 1" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
           </svg>
         </div>
+        {isSwitchingDevice && <span className="recording-screen__switching">Switching…</span>}
       </div>
 
       <button
