@@ -256,14 +256,15 @@ pub struct MeetingDetail {
     pub summary: Option<String>,
     pub transcript: Vec<TranscriptSegmentRow>,
     pub action_items: Vec<ActionItemRow>,
+    pub audio_path: Option<String>,
 }
 
 pub fn get_meeting_detail(conn: &Connection, meeting_id: i64) -> Result<MeetingDetail, StorageError> {
-    let (created_at, title, duration_secs, status, error_message) = conn
+    let (created_at, title, duration_secs, status, error_message, audio_path) = conn
         .query_row(
-            "SELECT created_at, title, duration_secs, status, error_message FROM meetings WHERE id = ?1",
+            "SELECT created_at, title, duration_secs, status, error_message, audio_path FROM meetings WHERE id = ?1",
             [meeting_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
         )
         .map_err(|_| StorageError::MeetingNotFound(meeting_id))?;
 
@@ -312,6 +313,7 @@ pub fn get_meeting_detail(conn: &Connection, meeting_id: i64) -> Result<MeetingD
         summary,
         transcript,
         action_items,
+        audio_path,
     })
 }
 
@@ -387,6 +389,7 @@ mod tests {
         assert_eq!(detail.summary.as_deref(), Some("A brief greeting exchange."));
         assert_eq!(detail.action_items.len(), 1);
         assert_eq!(detail.action_items[0].owner.as_deref(), Some("Jeremiah"));
+        assert_eq!(detail.audio_path.as_deref(), Some("/path/to/audio.wav"));
     }
 
     #[test]

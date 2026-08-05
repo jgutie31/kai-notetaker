@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import "./MeetingDetail.css";
 
 interface TranscriptSegmentRow {
@@ -25,6 +25,7 @@ interface MeetingDetailData {
   summary: string | null;
   transcript: TranscriptSegmentRow[];
   action_items: ActionItemRow[];
+  audio_path: string | null;
 }
 
 function formatTimestamp(ms: number): string {
@@ -82,6 +83,10 @@ export function MeetingDetail({ meetingId, onBack }: MeetingDetailProps) {
           <div className="detail-screen__meta">
             {Math.floor(detail.duration_secs / 60)}:{(detail.duration_secs % 60).toString().padStart(2, "0")}
           </div>
+
+          {detail.audio_path && (
+            <audio className="detail-audio-player" controls src={convertFileSrc(detail.audio_path)} />
+          )}
 
           {detail.status === "processing" && (
             <div className="detail-screen__processing">
