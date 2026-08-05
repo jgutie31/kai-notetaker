@@ -78,20 +78,32 @@ export function RecordingControl() {
     <div className="recording-screen">
       <div className="recording-screen__device">
         <label htmlFor="device-select">Microphone</label>
-        <select
-          id="device-select"
-          value={selectedDevice}
-          onChange={(e) => setSelectedDevice(e.target.value)}
-          disabled={isRecording || noDevices}
-        >
-          {noDevices && <option>No input device found</option>}
-          {devices.map((d) => (
-            <option key={d.name} value={d.name}>
-              {d.name}
-              {d.is_default ? " (default)" : ""}
-            </option>
-          ))}
-        </select>
+        <div className="recording-screen__select-wrap">
+          <select
+            id="device-select"
+            value={selectedDevice}
+            onChange={(e) => setSelectedDevice(e.target.value)}
+            disabled={isRecording || noDevices}
+          >
+            {noDevices && <option>No input device found</option>}
+            {devices.map((d) => (
+              <option key={d.name} value={d.name}>
+                {d.name}
+                {d.is_default ? " (default)" : ""}
+              </option>
+            ))}
+          </select>
+          <svg
+            className="recording-screen__chevron"
+            width="10"
+            height="6"
+            viewBox="0 0 10 6"
+            fill="none"
+            aria-hidden="true"
+          >
+            <path d="M1 1L5 5L9 1" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+          </svg>
+        </div>
       </div>
 
       <button
