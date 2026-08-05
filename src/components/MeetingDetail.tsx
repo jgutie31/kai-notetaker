@@ -56,13 +56,20 @@ interface MeetingDetailProps {
   onBack: () => void;
 }
 
+const MIN_TOP_HEIGHT = 140;
+const MIN_TRANSCRIPT_HEIGHT = 100;
+
 export function MeetingDetail({ meetingId, onBack }: MeetingDetailProps) {
   const [detail, setDetail] = useState<MeetingDetailData | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [currentTimeMs, setCurrentTimeMs] = useState(0);
+  const [topHeight, setTopHeight] = useState<number | null>(null);
+  const [isResizing, setIsResizing] = useState(false);
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const segmentRefs = useRef<(HTMLDivElement | null)[]>([]);
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const topRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -107,9 +114,48 @@ export function MeetingDetail({ meetingId, onBack }: MeetingDetailProps) {
     audioRef.current.currentTime = startMs / 1000;
   };
 
+  // Free-drag resize between the fixed top section and the transcript pane.
+  // Reads real layout numbers at drag-start (rather than assuming a fixed
+  // window size) so it clamps correctly regardless of window resize.
+  const handleResizerPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    const container = containerRef.current;
+    const topEl = topRef.current;
+    if (!container || !topEl) return;
+
+    e.preventDefault();
+    const startY = e.clientY;
+    const startHeight = topEl.getBoundingClientRect().height;
+    const containerHeight = container.getBoundingClientRect().height;
+    const resizerHeight = e.currentTarget.getBoundingClientRect().height;
+    const maxTopHeight = containerHeight - MIN_TRANSCRIPT_HEIGHT - resizerHeight;
+
+    setIsResizing(true);
+
+    const handlePointerMove = (moveEvent: PointerEvent) => {
+      const next = Math.min(
+        Math.max(startHeight + (moveEvent.clientY - startY), MIN_TOP_HEIGHT),
+        Math.max(maxTopHeight, MIN_TOP_HEIGHT),
+      );
+      setTopHeight(next);
+    };
+
+    const handlePointerUp = () => {
+      setIsResizing(false);
+      window.removeEventListener("pointermove", handlePointerMove);
+      window.removeEventListener("pointerup", handlePointerUp);
+    };
+
+    window.addEventListener("pointermove", handlePointerMove);
+    window.addEventListener("pointerup", handlePointerUp);
+  };
+
   return (
-    <div className="detail-screen">
-      <div className="detail-screen__top">
+    <div ref={containerRef} className={`detail-screen ${isResizing ? "detail-screen--resizing" : ""}`}>
+      <div
+        ref={topRef}
+        className="detail-screen__top"
+        style={topHeight !== null ? { height: topHeight, flex: "none" } : undefined}
+      >
         <button type="button" className="detail-screen__back" onClick={onBack}>
           ← Back to meetings
         </button>
@@ -175,28 +221,37 @@ export function MeetingDetail({ meetingId, onBack }: MeetingDetailProps) {
       </div>
 
       {detail && detail.status === "ready" && (
-        <div className="detail-screen__transcript">
-          <h2 className="detail-section__heading">Transcript</h2>
-          {detail.transcript.map((seg, i) => (
-            <div
-              key={i}
-              ref={(el) => {
-                segmentRefs.current[i] = el;
-              }}
-              className={`transcript-line ${i === activeIndex ? "transcript-line--active" : ""} ${
-                detail.audio_path ? "transcript-line--clickable" : ""
-              }`}
-              onClick={() => detail.audio_path && seekTo(seg.start_ms)}
-            >
-              <span className="transcript-line__speaker">
-                {seg.speaker !== null ? `Speaker ${seg.speaker}` : "—"}
-                <br />
-                {formatTimestamp(seg.start_ms)}
-              </span>
-              <span className="transcript-line__text">{seg.text}</span>
-            </div>
-          ))}
-        </div>
+        <>
+          <div
+            className="detail-screen__resizer"
+            role="separator"
+            aria-orientation="horizontal"
+            aria-label="Resize transcript section"
+            onPointerDown={handleResizerPointerDown}
+          />
+          <div className="detail-screen__transcript">
+            <h2 className="detail-section__heading">Transcript</h2>
+            {detail.transcript.map((seg, i) => (
+              <div
+                key={i}
+                ref={(el) => {
+                  segmentRefs.current[i] = el;
+                }}
+                className={`transcript-line ${i === activeIndex ? "transcript-line--active" : ""} ${
+                  detail.audio_path ? "transcript-line--clickable" : ""
+                }`}
+                onClick={() => detail.audio_path && seekTo(seg.start_ms)}
+              >
+                <span className="transcript-line__speaker">
+                  {seg.speaker !== null ? `Speaker ${seg.speaker}` : "—"}
+                  <br />
+                  {formatTimestamp(seg.start_ms)}
+                </span>
+                <span className="transcript-line__text">{seg.text}</span>
+              </div>
+            ))}
+          </div>
+        </>
       )}
     </div>
   );
