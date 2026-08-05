@@ -176,7 +176,7 @@ pub fn run() {
             let engines_state = app.state::<EnginesState>().0.clone();
             let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
             std::thread::spawn(move || {
-                let asr = match asr::AsrEngine::load(&manifest_dir.join("models/ggml-base.en.bin"), true) {
+                let asr = match asr::AsrEngine::load(&manifest_dir.join("models/ggml-base.bin"), true) {
                     Ok(e) => e,
                     Err(e) => {
                         eprintln!("failed to load ASR engine: {e}");

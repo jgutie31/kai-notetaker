@@ -125,7 +125,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn model_path() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/ggml-base.en.bin")
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/ggml-base.bin")
     }
 
     fn fixture_path() -> PathBuf {

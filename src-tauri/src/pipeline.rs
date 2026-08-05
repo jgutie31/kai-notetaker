@@ -164,7 +164,7 @@ mod tests {
 
     fn model_paths_exist() -> bool {
         let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        base.join("models/ggml-base.en.bin").exists()
+        base.join("models/ggml-base.bin").exists()
             && base.join("models/diarization/sherpa-onnx-pyannote-segmentation-3-0/model.onnx").exists()
             && base.join("models/diarization/speaker-embedding.onnx").exists()
             && base.join("models/llm/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf").exists()
@@ -186,7 +186,7 @@ mod tests {
         }
 
         let engines = PipelineEngines {
-            asr: AsrEngine::load(&base.join("models/ggml-base.en.bin"), true).unwrap(),
+            asr: AsrEngine::load(&base.join("models/ggml-base.bin"), true).unwrap(),
             diarization: DiarizationEngine::load(
                 &base.join("models/diarization/sherpa-onnx-pyannote-segmentation-3-0/model.onnx"),
                 &base.join("models/diarization/speaker-embedding.onnx"),
@@ -240,7 +240,7 @@ mod tests {
             return;
         }
         let engines = PipelineEngines {
-            asr: AsrEngine::load(&base.join("models/ggml-base.en.bin"), true).unwrap(),
+            asr: AsrEngine::load(&base.join("models/ggml-base.bin"), true).unwrap(),
             diarization: DiarizationEngine::load(
                 &base.join("models/diarization/sherpa-onnx-pyannote-segmentation-3-0/model.onnx"),
                 &base.join("models/diarization/speaker-embedding.onnx"),

@@ -43,7 +43,13 @@ fn chunk_summary_prompt(chunk: &str) -> String {
     format!(
         "<|start_header_id|>user<|end_header_id|>\n\n\
          Summarize the following meeting transcript excerpt in 2-4 sentences. \
-         Focus on decisions, facts, and commitments — skip filler and small talk.\n\n\
+         Focus on decisions, facts, and commitments — skip filler and small talk. \
+         The excerpt may be very short, informal, or a test recording — that is fine. \
+         Describe plainly whatever was actually said, even if it's just one sentence \
+         or sounds like a sound check. Do NOT say the transcript is missing, unclear, \
+         insufficient, or that you are unable to summarize it — there is always \
+         something to report, even if it's simply that someone did a brief test \
+         recording.\n\n\
          Excerpt:\n{chunk}\
          <|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
     )
@@ -110,8 +116,20 @@ pub fn summarize_meeting(
         chunk_summaries.push(summary.trim().to_string());
     }
 
-    let combined = chunk_summaries.join("\n\n");
-    let meeting_summary = engine.complete(&reduce_prompt(&combined), 400, n_ctx)?.trim().to_string();
+    // Real bug fixed here: running the "combine multiple summaries into
+    // one" reduce prompt when there was only ever ONE chunk gives the
+    // model nothing real to reduce across, and — especially for a short,
+    // thin transcript (a few seconds of audio) — it tends to respond with
+    // meta-commentary ("there is no meeting transcript provided...")
+    // instead of a plain answer. Skip the redundant reduce pass entirely
+    // when there's nothing to reduce; the single chunk summary already
+    // IS the meeting summary in that case.
+    let meeting_summary = if chunk_summaries.len() <= 1 {
+        chunk_summaries.first().cloned().unwrap_or_default()
+    } else {
+        let combined = chunk_summaries.join("\n\n");
+        engine.complete(&reduce_prompt(&combined), 400, n_ctx)?.trim().to_string()
+    };
 
     let action_items_raw = engine.complete(&action_items_prompt(&meeting_summary), 500, n_ctx)?;
     let action_items = extract_json_array(&action_items_raw)?;
@@ -162,6 +180,32 @@ mod tests {
     fn extract_json_array_errors_on_no_brackets() {
         let result = extract_json_array("There are no action items in this meeting.");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn short_thin_transcript_gets_a_direct_summary_not_meta_commentary() {
+        // Reproduces a real bug hit in production testing: a ~5-second
+        // recording (one short sentence, plus a garbled non-English
+        // fragment) produced a "summary" that was actually the model
+        // refusing to summarize ("It appears there is no meeting
+        // transcript excerpt provided...") instead of a plain answer.
+        let path = model_path();
+        if !path.exists() {
+            eprintln!("skipping: LLM model not present in this environment");
+            return;
+        }
+        let engine = LlmEngine::load(&path, 1000).unwrap();
+
+        let transcript = "Speaker 1: Test in one, two, three recording.\nSpeaker 1: For a van do uno doz tres.";
+        let result = summarize_meeting(&engine, transcript, 4096).unwrap();
+
+        assert!(!result.meeting_summary.trim().is_empty());
+        let lower = result.meeting_summary.to_lowercase();
+        assert!(
+            !lower.contains("no meeting transcript") && !lower.contains("unable to create"),
+            "summary regressed into meta-commentary/refusal instead of a direct answer: {}",
+            result.meeting_summary
+        );
     }
 
     #[test]
