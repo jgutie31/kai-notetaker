@@ -27,7 +27,15 @@ use thiserror::Error;
 /// was explicitly named as a use case, so this deliberately is NOT the
 /// 16kHz Whisper needs — that downsample happens separately, at ASR load
 /// time, from this higher-fidelity source).
-const CANONICAL_SAMPLE_RATE: u32 = 48_000;
+pub const CANONICAL_SAMPLE_RATE: u32 = 48_000;
+
+/// The sample rate ASR (`whisper-rs`) and diarization (`sherpa-onnx`
+/// pyannote-segmentation-3.0) both hard-require. Recordings are captured
+/// at `CANONICAL_SAMPLE_RATE` (48kHz, chosen for music-quality capture),
+/// so this batch resample is the explicit, visible step that bridges the
+/// two — never a silent default inside the ASR/diarization layers
+/// themselves (see `asr::read_wav_as_f32_mono_16k`'s doc comment).
+pub const PIPELINE_SAMPLE_RATE: u32 = 16_000;
 
 /// Frames-per-call for the streaming resampler. 1024 is a reasonable
 /// real-time chunk size — small enough for low latency, large enough that
@@ -202,6 +210,26 @@ fn find_device_by_name(name: &str) -> Result<cpal::Device, AudioCaptureError> {
         .ok_or_else(|| AudioCaptureError::DeviceNotFound(name.to_string()))
 }
 
+/// One-shot (not real-time streaming) resample of a complete mono buffer
+/// from `input_rate` to `output_rate`. Reuses the same `StreamingResampler`
+/// already tested for live device switching, feeding it the whole input
+/// plus a zero-padded flush chunk at the end so the sinc filter's trailing
+/// context gets processed — otherwise the last fractional chunk (at most
+/// `RESAMPLE_CHUNK_FRAMES` frames, a few milliseconds) would be silently
+/// dropped rather than resampled.
+pub fn one_shot_resample(samples: &[f32], input_rate: u32, output_rate: u32) -> Result<Vec<f32>, AudioCaptureError> {
+    if input_rate == output_rate {
+        return Ok(samples.to_vec());
+    }
+    let mut resampler = StreamingResampler::new(input_rate, output_rate)?;
+    let mut output = resampler.process(samples)?;
+
+    let flush_padding = vec![0.0_f32; RESAMPLE_CHUNK_FRAMES];
+    output.extend(resampler.process(&flush_padding)?);
+
+    Ok(output)
+}
+
 /// A recording session: owns the temp file path (inside `data_dir`, never
 /// outside it) and the currently-active cpal stream. The stream can be
 /// swapped mid-recording via `switch_device` without losing any audio
@@ -303,6 +331,26 @@ pub fn delete_recording(path: &Path) -> Result<(), AudioCaptureError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_shot_resample_downsamples_48k_to_16k_within_tolerance() {
+        let input = vec![0.0_f32; CANONICAL_SAMPLE_RATE as usize * 2]; // 2s @ 48kHz
+        let output = one_shot_resample(&input, CANONICAL_SAMPLE_RATE, PIPELINE_SAMPLE_RATE).unwrap();
+        let expected = PIPELINE_SAMPLE_RATE as usize * 2; // 2s @ 16kHz
+        let tolerance = RESAMPLE_CHUNK_FRAMES; // one chunk's worth, from the flush padding
+        assert!(
+            (output.len() as i64 - expected as i64).abs() < tolerance as i64,
+            "expected ~{expected} frames, got {}",
+            output.len()
+        );
+    }
+
+    #[test]
+    fn one_shot_resample_is_passthrough_when_rates_match() {
+        let input = vec![0.5_f32; 1000];
+        let output = one_shot_resample(&input, 16_000, 16_000).unwrap();
+        assert_eq!(output, input);
+    }
 
     #[test]
     fn list_input_devices_does_not_error_on_this_machine() {
