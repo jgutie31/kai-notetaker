@@ -1,14 +1,13 @@
 //! Real schema for persisted meetings, transcripts, summaries, action
-//! items, and embeddings. Still an unencrypted SQLite database — the
-//! SQLCipher key-from-keychain wiring (ISC-38/39) remains deferred and
-//! tracked separately; this module is about giving the Library/Detail
-//! screens real, structured, queryable content to display, not about
-//! encryption-at-rest (that's the StorageLayer Feature's job when it's
-//! actually picked up).
+//! items, and embeddings, on a database encrypted at rest via SQLCipher
+//! (ISC-38/39) — the key is sourced from the OS keychain, never a
+//! hardcoded literal or config file.
 
+use crate::keychain;
 use rusqlite::Connection;
 use serde::Serialize;
 use std::path::Path;
+use std::sync::OnceLock;
 use std::time::Duration;
 use thiserror::Error;
 
@@ -18,6 +17,61 @@ pub enum StorageError {
     Sqlite(#[from] rusqlite::Error),
     #[error("meeting {0} not found")]
     MeetingNotFound(i64),
+    #[error("keychain error: {0}")]
+    Keychain(#[from] keychain::KeychainError),
+    #[error("database could not be opened with the stored encryption key")]
+    WrongEncryptionKey,
+    #[error("filesystem error archiving legacy database: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+// Looked up once per process (a Keychain query on every command call
+// would be wasteful and unnecessary — the key never changes mid-session).
+static DB_KEY: OnceLock<Vec<u8>> = OnceLock::new();
+
+fn db_key() -> Result<&'static Vec<u8>, StorageError> {
+    if let Some(key) = DB_KEY.get() {
+        return Ok(key);
+    }
+    let key = keychain::get_or_create_db_key()?;
+    Ok(DB_KEY.get_or_init(|| key))
+}
+
+/// If `db_path` already holds a pre-encryption dev-era plaintext database
+/// (readable with no key at all), archive it rather than let SQLCipher
+/// choke on it. Dev-only: safe only because no real user data existed
+/// before encryption shipped — same discipline as `reset_if_schema_outdated`.
+fn archive_if_plaintext(db_path: &Path) -> Result<(), StorageError> {
+    if !db_path.exists() {
+        return Ok(());
+    }
+
+    let is_plaintext = Connection::open(db_path)
+        .and_then(|probe| probe.query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok(())))
+        .is_ok();
+    if !is_plaintext {
+        return Ok(());
+    }
+
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    eprintln!(
+        "storage: {db_path:?} is an unencrypted dev-era database — archiving before encryption takes over"
+    );
+    for suffix in ["", "-wal", "-shm"] {
+        let sidecar = Path::new(&format!("{}{suffix}", db_path.display())).to_path_buf();
+        if sidecar.exists() {
+            let backup = Path::new(&format!(
+                "{}.pre-encryption-backup-{timestamp}{suffix}",
+                db_path.display()
+            ))
+            .to_path_buf();
+            std::fs::rename(&sidecar, &backup)?;
+        }
+    }
+    Ok(())
 }
 
 /// Open a connection configured for the multi-thread/multi-connection
@@ -32,7 +86,14 @@ pub enum StorageError {
 /// failing immediately — this is the standard, documented fix for this
 /// class of error, not a workaround for a bug in the schema itself.
 pub fn open_connection(db_path: &Path) -> Result<Connection, StorageError> {
+    archive_if_plaintext(db_path)?;
+
     let conn = Connection::open(db_path)?;
+    let key = db_key()?;
+    conn.execute_batch(&format!("PRAGMA key = \"x'{}'\";", keychain::to_hex(key)))?;
+    conn.query_row("SELECT count(*) FROM sqlite_master;", [], |_| Ok(()))
+        .map_err(|_| StorageError::WrongEncryptionKey)?;
+
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.busy_timeout(Duration::from_secs(5))?;
     Ok(conn)
@@ -420,5 +481,75 @@ mod tests {
         let list = list_meetings(&conn).unwrap();
         assert_eq!(list[0].id, id2);
         assert_eq!(list[1].id, id1);
+    }
+
+    // ISC-38: real file, real key from the keychain — the on-disk bytes
+    // must never contain the plaintext value, not just "PRAGMA key was set".
+    #[test]
+    fn open_connection_actually_encrypts_the_database_file() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        {
+            let conn = open_connection(&path).unwrap();
+            ensure_schema(&conn).unwrap();
+            create_meeting(&conn, "unmistakable-plaintext-marker.wav", 42).unwrap();
+        }
+
+        let raw = std::fs::read(&path).unwrap();
+        let needle = b"unmistakable-plaintext-marker.wav";
+        assert!(
+            !raw.windows(needle.len()).any(|w| w == needle),
+            "found the real audio path in plaintext on disk — database is not actually encrypted"
+        );
+    }
+
+    // ISC-39: opening with the wrong key must fail, not silently succeed.
+    #[test]
+    fn wrong_key_cannot_read_data_written_with_the_real_key() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        {
+            let conn = open_connection(&path).unwrap();
+            ensure_schema(&conn).unwrap();
+            create_meeting(&conn, "real-key-wrote-this.wav", 10).unwrap();
+        }
+
+        let wrong_key_conn = Connection::open(&path).unwrap();
+        wrong_key_conn
+            .execute_batch("PRAGMA key = \"x'0000000000000000000000000000000000000000000000000000000000000000'\";")
+            .unwrap();
+        let result = wrong_key_conn.query_row::<i64, _, _>("SELECT count(*) FROM meetings", [], |r| r.get(0));
+        assert!(result.is_err(), "wrong key should not be able to read the meetings table");
+    }
+
+    // A pre-encryption dev-era plaintext file must be archived, not
+    // corrupted, when this code first runs against it.
+    #[test]
+    fn legacy_plaintext_database_is_archived_not_corrupted() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        {
+            // Simulate the real pre-encryption dev DB: a plain, un-keyed
+            // connection with real schema and a real row already in it.
+            let plain = Connection::open(&path).unwrap();
+            ensure_schema(&plain).unwrap();
+            create_meeting(&plain, "pre-encryption-dev-data.wav", 5).unwrap();
+        }
+
+        let conn = open_connection(&path).unwrap();
+        ensure_schema(&conn).unwrap();
+        let meetings = list_meetings(&conn).unwrap();
+        assert!(meetings.is_empty(), "expected a fresh encrypted db, not the archived plaintext data");
+
+        let parent = path.parent().unwrap();
+        let stem = path.file_name().unwrap().to_string_lossy().to_string();
+        let archived = std::fs::read_dir(parent)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().starts_with(&format!("{stem}.pre-encryption-backup-")));
+        assert!(archived, "expected the original plaintext file to be archived alongside the new one");
     }
 }
