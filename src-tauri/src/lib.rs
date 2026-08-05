@@ -12,12 +12,55 @@ mod summarization;
 use audit_log::AuditLog;
 use retention::RetentionPolicy;
 use rusqlite::Connection;
-use tauri::Manager;
+use std::sync::Mutex;
+use std::time::Instant;
+use tauri::{Manager, State};
 
-// Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
+/// Holds the in-progress recording (if any) across separate command
+/// invocations from the frontend (start → ... → stop are two distinct
+/// calls). `cpal::Stream` is confirmed `Send + Sync` on macOS via the
+/// crate's own compile-time assertion, so this is sound to hold in
+/// Tauri's managed state without any unsafe wrapper.
+#[derive(Default)]
+struct RecordingState(Mutex<Option<(audio_capture::RecordingSession, Instant)>>);
+
 #[tauri::command]
-fn greet(name: &str) -> String {
-    format!("Hello, {}! You've been greeted from Rust!", name)
+fn list_audio_devices() -> Result<Vec<audio_capture::InputDeviceInfo>, String> {
+    audio_capture::list_input_devices().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn start_recording(app: tauri::AppHandle, state: State<RecordingState>) -> Result<(), String> {
+    let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let recording_id = chrono::Utc::now().format("%Y%m%dT%H%M%S").to_string();
+
+    let session = audio_capture::RecordingSession::start(&data_dir, &recording_id)
+        .map_err(|e| e.to_string())?;
+
+    let mut guard = state.0.lock().map_err(|_| "recording state lock poisoned")?;
+    if guard.is_some() {
+        return Err("a recording is already in progress".to_string());
+    }
+    *guard = Some((session, Instant::now()));
+    Ok(())
+}
+
+#[derive(serde::Serialize)]
+struct StopRecordingResult {
+    path: String,
+    duration_secs: u64,
+}
+
+#[tauri::command]
+fn stop_recording(state: State<RecordingState>) -> Result<StopRecordingResult, String> {
+    let mut guard = state.0.lock().map_err(|_| "recording state lock poisoned")?;
+    let (session, started_at) = guard.take().ok_or("no recording in progress")?;
+    let elapsed = started_at.elapsed().as_secs();
+    let path = session.stop_and_write().map_err(|e| e.to_string())?;
+    Ok(StopRecordingResult {
+        path: path.display().to_string(),
+        duration_secs: elapsed,
+    })
 }
 
 /// Placeholder schema sufficient for the retention scheduler to run against
@@ -38,7 +81,12 @@ fn ensure_placeholder_schema(conn: &Connection) -> rusqlite::Result<()> {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![greet])
+        .manage(RecordingState::default())
+        .invoke_handler(tauri::generate_handler![
+            list_audio_devices,
+            start_recording,
+            stop_recording
+        ])
         .setup(|app| {
             let data_dir = app
                 .path()

@@ -1,0 +1,110 @@
+/* Design tokens — KCG-derived palette/typography, no KCG logo/wordmark
+   anywhere in the app itself (per explicit instruction). Colors and the
+   Cormorant Garamond display face come straight from the KCG Brand
+   Assets & Style Guide; everything else (motion, spacing, UI font stack)
+   is this app's own system, built to feel native on macOS/Windows rather
+   than like a themed web page. */
+
+@font-face {
+  font-family: "Cormorant Garamond";
+  src: url("../assets/fonts/CormorantGaramond-Variable.ttf") format("truetype-variations");
+  font-weight: 300 700;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Cormorant Garamond";
+  src: url("../assets/fonts/CormorantGaramond-Italic-Variable.ttf") format("truetype-variations");
+  font-weight: 300 700;
+  font-style: italic;
+  font-display: swap;
+}
+
+:root {
+  /* Brand palette (KCG Brand Assets & Style Guide) */
+  --kcg-navy: #233469;
+  --kcg-teal: #40a5ac;
+  --kcg-amber: #fda626;
+
+  /* Light mode semantic tokens */
+  --color-bg: #fafaf9;
+  --color-surface: #ffffff;
+  --color-surface-raised: #ffffff;
+  --color-border: rgba(35, 52, 105, 0.12);
+  --color-text-primary: #1a1d29;
+  --color-text-secondary: rgba(26, 29, 41, 0.62);
+  --color-accent: var(--kcg-teal);
+  --color-accent-strong: var(--kcg-navy);
+  --color-danger: #c4432b;
+  --color-danger-surface: rgba(196, 67, 43, 0.1);
+  --shadow-elevated: 0 1px 2px rgba(20, 24, 40, 0.04), 0 8px 24px rgba(20, 24, 40, 0.08);
+
+  /* Typography */
+  --font-display: "Cormorant Garamond", Georgia, serif;
+  --font-ui:
+    -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui, sans-serif;
+  --font-mono: "SF Mono", ui-monospace, "Cascadia Code", monospace;
+
+  /* Motion tokens — single source of truth so every transition in the app
+     shares the same feel (this is the "motion tokens" antecedent the ISA
+     calls out as a precondition for the Apple-caliber feel, not a nice-
+     to-have). Durations in ms, easings as cubic-bezier matching macOS's
+     own standard interface curve. */
+  --ease-standard: cubic-bezier(0.4, 0, 0.2, 1);
+  --ease-decelerate: cubic-bezier(0, 0, 0.2, 1);
+  --ease-accelerate: cubic-bezier(0.4, 0, 1, 1);
+  --duration-instant: 100ms;
+  --duration-fast: 180ms;
+  --duration-base: 280ms;
+  --duration-slow: 420ms;
+
+  --radius-sm: 8px;
+  --radius-md: 14px;
+  --radius-lg: 20px;
+  --radius-full: 999px;
+
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-12: 48px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --color-bg: #0f1117;
+    --color-surface: #171a23;
+    --color-surface-raised: #1e222d;
+    --color-border: rgba(255, 255, 255, 0.09);
+    --color-text-primary: #f2f3f7;
+    --color-text-secondary: rgba(242, 243, 247, 0.6);
+    --color-accent: #5fc2c9;
+    --color-accent-strong: #6b83c9;
+    --color-danger: #e0725a;
+    --color-danger-surface: rgba(224, 114, 90, 0.16);
+    --shadow-elevated: 0 1px 2px rgba(0, 0, 0, 0.24), 0 8px 24px rgba(0, 0, 0, 0.36);
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--color-bg);
+  color: var(--color-text-primary);
+  font-family: var(--font-ui);
+  -webkit-font-smoothing: antialiased;
+  overscroll-behavior: none;
+  user-select: none;
+}
