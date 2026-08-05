@@ -2,6 +2,7 @@ mod asr;
 mod audio_capture;
 mod audit_log;
 mod cloud_sync_gate;
+mod diarization;
 mod retention;
 
 use audit_log::AuditLog;

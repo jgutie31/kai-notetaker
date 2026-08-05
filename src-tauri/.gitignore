@@ -9,6 +9,7 @@
 # Model binaries — large, downloaded on demand, never committed
 /models/*.bin
 /models/*.gguf
+/models/diarization/
 
 # Local test fixture audio (generated via macOS `say`, not source-controlled)
 /test-fixtures/*.wav
