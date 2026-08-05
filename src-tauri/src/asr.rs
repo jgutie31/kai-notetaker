@@ -61,7 +61,19 @@ impl AsrEngine {
             .create_state()
             .map_err(|e| AsrError::StateCreate(e.to_string()))?;
 
-        let params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+        let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+        // Real bug fixed here: whisper.cpp's own default `language` field
+        // is hardcoded to "en" — NOT "auto" — when left unset. Confirmed
+        // directly against the vendored whisper.cpp source
+        // (`/*.language = */ "en"` in `whisper_full_default_params`).
+        // Leaving it at that default meant every recording was decoded as
+        // if it were English regardless of what was actually spoken,
+        // which for genuine non-English speech produces a forced,
+        // sometimes-plausible-looking but unreliable English rendering —
+        // not a real transcription and not real translation either.
+        // Auto-detect + transcribe-in-original-language, per Jeremiah's
+        // explicit choice (2026-08-05) over always-translate-to-English.
+        params.set_language(Some("auto"));
         state
             .full(params, samples)
             .map_err(|e| AsrError::Transcribe(e.to_string()))?;
@@ -148,6 +160,40 @@ mod tests {
         let spec = reader.spec();
         assert_eq!(spec.channels, 1);
         assert_eq!(spec.sample_rate, 16000);
+    }
+
+    #[test]
+    fn spanish_speech_is_transcribed_in_spanish_not_forced_english() {
+        // Reproduces the real bug Jeremiah hit: whisper.cpp's default
+        // `language` field is hardcoded to "en" when unset, so Spanish
+        // audio got decoded as if it were English. This asserts the fix
+        // (auto-detect via `set_language(Some("auto"))`) actually works
+        // against real generated Spanish speech, not just that it compiles.
+        let model = model_path();
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test-fixtures/test-speech-spanish-16k-mono.wav");
+        if !model.exists() || !fixture.exists() {
+            eprintln!("skipping: model ({model:?}) or fixture ({fixture:?}) not present in this environment");
+            return;
+        }
+
+        let samples = read_wav_as_f32_mono_16k(&fixture).unwrap();
+        let engine = AsrEngine::load(&model, true).unwrap();
+        let segments = engine.transcribe(&samples).unwrap();
+
+        let full_text: String = segments.iter().map(|s| s.text.as_str()).collect::<Vec<_>>().join(" ");
+        assert!(!full_text.trim().is_empty(), "transcribed text should not be empty");
+
+        let lower = full_text.to_lowercase();
+        // The fixture said "Buenos días, esto es una grabación de prueba
+        // en español." — real Spanish words that would NOT appear if the
+        // model were forced into English decoding again.
+        assert!(
+            lower.contains("buenos") || lower.contains("días") || lower.contains("dias")
+                || lower.contains("grabación") || lower.contains("grabacion")
+                || lower.contains("español") || lower.contains("espanol")
+                || lower.contains("prueba"),
+            "expected real Spanish words in the transcript, got: {full_text:?} — language auto-detection may have regressed"
+        );
     }
 
     #[test]
