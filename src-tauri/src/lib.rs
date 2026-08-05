@@ -1,3 +1,5 @@
+mod asr;
+mod audio_capture;
 mod audit_log;
 mod cloud_sync_gate;
 mod retention;

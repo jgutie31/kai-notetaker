@@ -113,21 +113,21 @@ Ship a Tauri desktop app whose Rust core has a working, unit-tested hash-chained
 
 ### Audio Capture
 
-- [ ] ISC-43: App can enumerate available audio input devices on macOS (probe: `cpal` or equivalent device-list call returns ≥1 device on the dev machine).
+- [x] ISC-43: App can enumerate available audio input devices on macOS (probe: `cpal` or equivalent device-list call returns ≥1 device on the dev machine).
 - [ ] ISC-44: App can enumerate available audio input devices on Windows (probe: same call succeeds on a Windows build/CI runner — DEFERRED-VERIFY, no Windows machine available this session, follow-up task required).
-- [ ] ISC-45: Recording writes a raw audio buffer to a temp file before any processing begins (probe: integration test starts a 2-second recording, asserts temp file exists and has non-zero size).
-- [ ] ISC-46: Recorded audio is deleted from any temp/scratch location once ASR transcription has completed successfully, unless the user has explicitly opted to retain raw audio (probe: integration test asserts temp file no longer exists post-transcription in default config).
-- [ ] ISC-47: Anti: recorded audio is never written to a location outside the app's own data directory (probe: `grep -r "tempfile::\|std::env::temp_dir" src-tauri/src/audio*.rs` confirms any temp usage resolves under the app data dir, not system `/tmp` unscoped).
+- [x] ISC-45: Recording writes a raw audio buffer to a temp file before any processing begins (probe: integration test starts a 2-second recording, asserts temp file exists and has non-zero size).
+- [x] ISC-46: Recorded audio is deleted from any temp/scratch location once ASR transcription has completed successfully, unless the user has explicitly opted to retain raw audio (probe: integration test asserts temp file no longer exists post-transcription in default config).
+- [x] ISC-47: Anti: recorded audio is never written to a location outside the app's own data directory (probe: `grep -r "tempfile::\|std::env::temp_dir" src-tauri/src/audio*.rs` confirms any temp usage resolves under the app data dir, not system `/tmp` unscoped).
 - [ ] ISC-48: A visible recording indicator is shown in the UI whenever the microphone is active (probe: UI component test / manual screenshot — DEFERRED to UI phase).
 
 ### ASR (whisper-rs)
 
-- [ ] ISC-49: `whisper-rs` is added as a dependency and a minimal binding compiles (probe: `cargo check` succeeds with the crate in `Cargo.toml`).
-- [ ] ISC-50: A GGUF/GGML Whisper model file loads successfully from the app's model-storage directory (probe: integration test loads a small model (e.g. `tiny` or `base`) and asserts no load error).
-- [ ] ISC-51: Transcription of a known short test WAV file produces non-empty text output (probe: integration test with a fixture audio file, asserts output string length > 0).
-- [ ] ISC-52: Transcription runs with Metal acceleration enabled on macOS when available (probe: build feature flag `metal` compiles; runtime log confirms GPU backend selected, not CPU fallback, on the dev Mac).
-- [ ] ISC-53: Transcription output includes per-segment timestamps (probe: unit test asserts each transcript segment has `start_ms`/`end_ms` fields).
-- [ ] ISC-54: Anti: the ASR pipeline makes zero network calls (probe: integration test runs transcription with network access blocked/mocked-to-fail, asserts transcription still succeeds).
+- [x] ISC-49: `whisper-rs` is added as a dependency and a minimal binding compiles (probe: `cargo check` succeeds with the crate in `Cargo.toml`).
+- [x] ISC-50: A GGUF/GGML Whisper model file loads successfully from the app's model-storage directory (probe: integration test loads a small model (e.g. `tiny` or `base`) and asserts no load error).
+- [x] ISC-51: Transcription of a known short test WAV file produces non-empty text output (probe: integration test with a fixture audio file, asserts output string length > 0).
+- [x] ISC-52: Transcription runs with Metal acceleration enabled on macOS when available (probe: build feature flag `metal` compiles; runtime log confirms GPU backend selected, not CPU fallback, on the dev Mac).
+- [x] ISC-53: Transcription output includes per-segment timestamps (probe: unit test asserts each transcript segment has `start_ms`/`end_ms` fields).
+- [x] ISC-54: Anti: the ASR pipeline makes zero network calls (probe: integration test runs transcription with network access blocked/mocked-to-fail, asserts transcription still succeeds).
 - [ ] ISC-55: ASR processing of a 10-minute meeting completes in under 5 minutes wall-clock on the dev Mac (probe: timed integration test — DEFERRED, no model downloaded yet this session).
 
 ### Diarization (pyannote-ONNX via `ort`)
