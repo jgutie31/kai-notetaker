@@ -109,90 +109,94 @@ export function MeetingDetail({ meetingId, onBack }: MeetingDetailProps) {
 
   return (
     <div className="detail-screen">
-      <button type="button" className="detail-screen__back" onClick={onBack}>
-        ← Back to meetings
-      </button>
+      <div className="detail-screen__top">
+        <button type="button" className="detail-screen__back" onClick={onBack}>
+          ← Back to meetings
+        </button>
 
-      {error && <div className="recording-screen__error">{error}</div>}
+        {error && <div className="recording-screen__error">{error}</div>}
 
-      {detail && (
-        <>
-          <h1 className="detail-screen__title">{detail.title ?? "Processing…"}</h1>
-          <div className="detail-screen__meta">
-            {Math.floor(detail.duration_secs / 60)}:{(detail.duration_secs % 60).toString().padStart(2, "0")}
-          </div>
-
-          {detail.audio_path && (
-            <audio
-              ref={audioRef}
-              className="detail-audio-player"
-              controls
-              src={convertFileSrc(detail.audio_path)}
-              onTimeUpdate={(e) => setCurrentTimeMs(e.currentTarget.currentTime * 1000)}
-            />
-          )}
-
-          {detail.status === "processing" && (
-            <div className="detail-screen__processing">
-              Transcribing, diarizing, and summarizing this meeting — this can take a few minutes for longer
-              recordings. This page updates automatically.
+        {detail && (
+          <>
+            <h1 className="detail-screen__title">{detail.title ?? "Processing…"}</h1>
+            <div className="detail-screen__meta">
+              {Math.floor(detail.duration_secs / 60)}:{(detail.duration_secs % 60).toString().padStart(2, "0")}
             </div>
-          )}
 
-          {detail.status === "failed" && (
-            <div className="detail-screen__failed">
-              Processing failed: {detail.error_message ?? "unknown error"}
-            </div>
-          )}
+            {detail.audio_path && (
+              <audio
+                ref={audioRef}
+                className="detail-audio-player"
+                controls
+                src={convertFileSrc(detail.audio_path)}
+                onTimeUpdate={(e) => setCurrentTimeMs(e.currentTarget.currentTime * 1000)}
+              />
+            )}
 
-          {detail.status === "ready" && (
-            <>
-              {detail.summary && (
-                <div className="detail-section">
-                  <h2 className="detail-section__heading">Summary</h2>
-                  <div className="detail-summary">{detail.summary}</div>
-                </div>
-              )}
-
-              {detail.action_items.length > 0 && (
-                <div className="detail-section">
-                  <h2 className="detail-section__heading">Action Items</h2>
-                  {detail.action_items.map((item, i) => (
-                    <div key={i} className="action-item">
-                      <span className="action-item__description">{item.description}</span>
-                      <span className="action-item__meta">
-                        {[item.owner, item.due_date].filter(Boolean).join(" · ")}
-                      </span>
-                    </div>
-                  ))}
-                </div>
-              )}
-
-              <div className="detail-section">
-                <h2 className="detail-section__heading">Transcript</h2>
-                {detail.transcript.map((seg, i) => (
-                  <div
-                    key={i}
-                    ref={(el) => {
-                      segmentRefs.current[i] = el;
-                    }}
-                    className={`transcript-line ${i === activeIndex ? "transcript-line--active" : ""} ${
-                      detail.audio_path ? "transcript-line--clickable" : ""
-                    }`}
-                    onClick={() => detail.audio_path && seekTo(seg.start_ms)}
-                  >
-                    <span className="transcript-line__speaker">
-                      {seg.speaker !== null ? `Speaker ${seg.speaker}` : "—"}
-                      <br />
-                      {formatTimestamp(seg.start_ms)}
-                    </span>
-                    <span className="transcript-line__text">{seg.text}</span>
-                  </div>
-                ))}
+            {detail.status === "processing" && (
+              <div className="detail-screen__processing">
+                Transcribing, diarizing, and summarizing this meeting — this can take a few minutes for longer
+                recordings. This page updates automatically.
               </div>
-            </>
-          )}
-        </>
+            )}
+
+            {detail.status === "failed" && (
+              <div className="detail-screen__failed">
+                Processing failed: {detail.error_message ?? "unknown error"}
+              </div>
+            )}
+
+            {detail.status === "ready" && (
+              <>
+                {detail.summary && (
+                  <div className="detail-section">
+                    <h2 className="detail-section__heading">Summary</h2>
+                    <div className="detail-summary">{detail.summary}</div>
+                  </div>
+                )}
+
+                {detail.action_items.length > 0 && (
+                  <div className="detail-section">
+                    <h2 className="detail-section__heading">Action Items</h2>
+                    {detail.action_items.map((item, i) => (
+                      <div key={i} className="action-item">
+                        <span className="action-item__description">{item.description}</span>
+                        <span className="action-item__meta">
+                          {[item.owner, item.due_date].filter(Boolean).join(" · ")}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </>
+            )}
+          </>
+        )}
+      </div>
+
+      {detail && detail.status === "ready" && (
+        <div className="detail-screen__transcript">
+          <h2 className="detail-section__heading">Transcript</h2>
+          {detail.transcript.map((seg, i) => (
+            <div
+              key={i}
+              ref={(el) => {
+                segmentRefs.current[i] = el;
+              }}
+              className={`transcript-line ${i === activeIndex ? "transcript-line--active" : ""} ${
+                detail.audio_path ? "transcript-line--clickable" : ""
+              }`}
+              onClick={() => detail.audio_path && seekTo(seg.start_ms)}
+            >
+              <span className="transcript-line__speaker">
+                {seg.speaker !== null ? `Speaker ${seg.speaker}` : "—"}
+                <br />
+                {formatTimestamp(seg.start_ms)}
+              </span>
+              <span className="transcript-line__text">{seg.text}</span>
+            </div>
+          ))}
+        </div>
       )}
     </div>
   );
