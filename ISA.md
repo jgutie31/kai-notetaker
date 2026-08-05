@@ -5,10 +5,10 @@ project: kai-notetaker
 effort: deep
 effort_source: classifier
 phase: execute
-progress: 40/93
+progress: 57/93
 mode: interactive
 started: 2026-08-05T13:36:00Z
-updated: 2026-08-05T15:35:00Z
+updated: 2026-08-05T17:15:00Z
 ---
 
 ## Problem
@@ -140,8 +140,8 @@ Ship a Tauri desktop app whose Rust core has a working, unit-tested hash-chained
 
 ### Local LLM Pipeline (Summarization / Action Items / Embeddings / Q&A)
 
-- [ ] ISC-61: A local inference runtime (llama.cpp bindings or equivalent) is added and compiles (probe: `cargo check` succeeds).
-- [ ] ISC-62: A quantized local model (Qwen2.5-14B-Instruct or Llama-3.1-8B fallback) loads successfully (probe: integration test — DEFERRED, model not yet downloaded this session).
+- [x] ISC-61: A local inference runtime (llama.cpp bindings or equivalent) is added and compiles (probe: `cargo check` succeeds).
+- [x] ISC-62: A quantized local model (Qwen2.5-14B-Instruct or Llama-3.1-8B fallback) loads successfully (probe: integration test — DEFERRED, model not yet downloaded this session).
 - [ ] ISC-63: Long transcripts are chunked into ~2K-token windows with 200-token overlap before summarization (probe: unit test on the chunking function with a fixture transcript, asserts window size and overlap match spec within tolerance).
 - [ ] ISC-64: Chunk summaries are hierarchically merged into a single meeting summary (map-reduce), not concatenated raw (probe: unit test asserts final summary length is bounded, not O(n) with chunk count).
 - [ ] ISC-65: Action-item extraction returns structured JSON (not freeform text) matching a defined schema (probe: unit test validates output against JSON schema, asserts parse success).

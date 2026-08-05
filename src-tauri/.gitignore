@@ -10,6 +10,7 @@
 /models/*.bin
 /models/*.gguf
 /models/diarization/
+/models/llm/
 
 # Local test fixture audio (generated via macOS `say`, not source-controlled)
 /test-fixtures/*.wav

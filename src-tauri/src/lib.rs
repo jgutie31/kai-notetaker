@@ -3,6 +3,7 @@ mod audio_capture;
 mod audit_log;
 mod cloud_sync_gate;
 mod diarization;
+mod llm;
 mod retention;
 
 use audit_log::AuditLog;
