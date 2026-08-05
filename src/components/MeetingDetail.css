@@ -83,9 +83,28 @@
 .transcript-line {
   display: flex;
   gap: var(--space-3);
-  padding: var(--space-2) 0;
+  padding: var(--space-2) var(--space-2);
+  margin: 0 calc(var(--space-2) * -1);
+  border-radius: var(--radius-sm);
   font-size: 13px;
   line-height: 1.5;
+  transition: background var(--duration-fast) var(--ease-standard);
+}
+
+.transcript-line--clickable {
+  cursor: pointer;
+}
+
+.transcript-line--clickable:hover {
+  background: var(--color-surface);
+}
+
+.transcript-line--active {
+  background: rgba(64, 165, 172, 0.12);
+}
+
+.transcript-line--active .transcript-line__speaker {
+  color: var(--color-accent);
 }
 
 .transcript-line__speaker {

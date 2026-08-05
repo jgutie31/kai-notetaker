@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import "./MeetingDetail.css";
 
@@ -35,6 +35,22 @@ function formatTimestamp(ms: number): string {
   return `${minutes}:${seconds.toString().padStart(2, "0")}`;
 }
 
+/// Finds the transcript segment whose [start_ms, end_ms) window contains
+/// currentTimeMs. Falls back to the last segment whose start has already
+/// passed, so the highlight doesn't just disappear during small gaps
+/// between segments (pauses, cross-talk) — it should feel continuous.
+function findActiveSegmentIndex(transcript: TranscriptSegmentRow[], currentTimeMs: number): number {
+  const exact = transcript.findIndex((s) => currentTimeMs >= s.start_ms && currentTimeMs < s.end_ms);
+  if (exact !== -1) return exact;
+
+  let lastPassed = -1;
+  for (let i = 0; i < transcript.length; i++) {
+    if (transcript[i].start_ms <= currentTimeMs) lastPassed = i;
+    else break;
+  }
+  return lastPassed;
+}
+
 interface MeetingDetailProps {
   meetingId: number;
   onBack: () => void;
@@ -43,6 +59,10 @@ interface MeetingDetailProps {
 export function MeetingDetail({ meetingId, onBack }: MeetingDetailProps) {
   const [detail, setDetail] = useState<MeetingDetailData | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [currentTimeMs, setCurrentTimeMs] = useState(0);
+
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const segmentRefs = useRef<(HTMLDivElement | null)[]>([]);
 
   useEffect(() => {
     let cancelled = false;
@@ -69,6 +89,24 @@ export function MeetingDetail({ meetingId, onBack }: MeetingDetailProps) {
     };
   }, [meetingId]);
 
+  const activeIndex = useMemo(
+    () => (detail ? findActiveSegmentIndex(detail.transcript, currentTimeMs) : -1),
+    [detail, currentTimeMs],
+  );
+
+  // Auto-scroll to whichever segment just became active — only fires when
+  // the active index actually changes, not on every timeupdate tick, so it
+  // doesn't fight a user who's manually scrolled elsewhere to read ahead.
+  useEffect(() => {
+    if (activeIndex < 0) return;
+    segmentRefs.current[activeIndex]?.scrollIntoView({ behavior: "smooth", block: "center" });
+  }, [activeIndex]);
+
+  const seekTo = (startMs: number) => {
+    if (!audioRef.current) return;
+    audioRef.current.currentTime = startMs / 1000;
+  };
+
   return (
     <div className="detail-screen">
       <button type="button" className="detail-screen__back" onClick={onBack}>
@@ -85,7 +123,13 @@ export function MeetingDetail({ meetingId, onBack }: MeetingDetailProps) {
           </div>
 
           {detail.audio_path && (
-            <audio className="detail-audio-player" controls src={convertFileSrc(detail.audio_path)} />
+            <audio
+              ref={audioRef}
+              className="detail-audio-player"
+              controls
+              src={convertFileSrc(detail.audio_path)}
+              onTimeUpdate={(e) => setCurrentTimeMs(e.currentTarget.currentTime * 1000)}
+            />
           )}
 
           {detail.status === "processing" && (
@@ -127,7 +171,16 @@ export function MeetingDetail({ meetingId, onBack }: MeetingDetailProps) {
               <div className="detail-section">
                 <h2 className="detail-section__heading">Transcript</h2>
                 {detail.transcript.map((seg, i) => (
-                  <div key={i} className="transcript-line">
+                  <div
+                    key={i}
+                    ref={(el) => {
+                      segmentRefs.current[i] = el;
+                    }}
+                    className={`transcript-line ${i === activeIndex ? "transcript-line--active" : ""} ${
+                      detail.audio_path ? "transcript-line--clickable" : ""
+                    }`}
+                    onClick={() => detail.audio_path && seekTo(seg.start_ms)}
+                  >
                     <span className="transcript-line__speaker">
                       {seg.speaker !== null ? `Speaker ${seg.speaker}` : "—"}
                       <br />
