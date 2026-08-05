@@ -38,7 +38,54 @@ pub fn open_connection(db_path: &Path) -> Result<Connection, StorageError> {
     Ok(conn)
 }
 
+/// Root cause of a real bug hit during testing: `CREATE TABLE IF NOT
+/// EXISTS` does not migrate an existing table's shape — if `meetings`
+/// already exists from an older schema version (e.g. the original
+/// placeholder table that only had `id`/`created_at`, from earlier in
+/// this same development cycle), the new columns this module expects
+/// silently never get added, and every query referencing them fails at
+/// runtime instead of at schema-creation time.
+///
+/// This is a DEV-ONLY reset, not a real migration system: if the
+/// `meetings` table exists but is missing a column this schema version
+/// expects, every app table is dropped and recreated from scratch. That
+/// is only acceptable because no real user data exists yet — the actual
+/// StorageLayer feature (SQLCipher, real migrations) must replace this
+/// before any real meeting recording anyone cares about could be lost.
+fn reset_if_schema_outdated(conn: &Connection) -> Result<(), StorageError> {
+    let table_exists: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='meetings'",
+            [],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+    if !table_exists {
+        return Ok(());
+    }
+
+    let has_title_column: bool = conn
+        .prepare("SELECT title FROM meetings LIMIT 1")
+        .is_ok();
+    if has_title_column {
+        return Ok(());
+    }
+
+    eprintln!("storage: detected outdated dev schema on 'meetings' table — resetting all app tables");
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS transcript_segments;
+         DROP TABLE IF EXISTS meeting_summaries;
+         DROP TABLE IF EXISTS action_items;
+         DROP TABLE IF EXISTS meeting_embeddings;
+         DROP TABLE IF EXISTS embeddings;
+         DROP TABLE IF EXISTS transcripts;
+         DROP TABLE IF EXISTS meetings;",
+    )?;
+    Ok(())
+}
+
 pub fn ensure_schema(conn: &Connection) -> Result<(), StorageError> {
+    reset_if_schema_outdated(conn)?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS meetings (
             id INTEGER PRIMARY KEY,
@@ -276,6 +323,45 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         ensure_schema(&conn).unwrap();
         conn
+    }
+
+    #[test]
+    fn ensure_schema_resets_an_outdated_meetings_table_instead_of_erroring() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Simulate the real bug: an old-shape meetings table already exists
+        // (this exact statement is what the original placeholder schema
+        // created, before `title`/`duration_secs`/etc. existed).
+        conn.execute_batch("CREATE TABLE meetings (id INTEGER PRIMARY KEY, created_at TEXT NOT NULL);")
+            .unwrap();
+        conn.execute("INSERT INTO meetings (created_at) VALUES (datetime('now'))", [])
+            .unwrap();
+
+        // Must not error, and must leave a fully-usable new-shape table —
+        // this is the exact query that broke in real testing.
+        ensure_schema(&conn).unwrap();
+        let list = list_meetings(&conn).unwrap();
+        assert!(list.is_empty(), "old dev row is expected to be gone after a dev-schema reset");
+
+        // And the schema now genuinely supports the new columns.
+        let id = create_meeting(&conn, "/some/path.wav", 42).unwrap();
+        mark_meeting_ready(&conn, id, "Test Meeting").unwrap();
+        let list = list_meetings(&conn).unwrap();
+        assert_eq!(list[0].title.as_deref(), Some("Test Meeting"));
+    }
+
+    #[test]
+    fn ensure_schema_is_a_true_noop_when_schema_already_current() {
+        let conn = test_db();
+        let id = create_meeting(&conn, "/a.wav", 10).unwrap();
+        mark_meeting_ready(&conn, id, "Keep Me").unwrap();
+
+        // Calling ensure_schema again (e.g. every command handler does
+        // this) must NOT wipe data when the schema is already correct.
+        ensure_schema(&conn).unwrap();
+
+        let list = list_meetings(&conn).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].title.as_deref(), Some("Keep Me"));
     }
 
     #[test]
