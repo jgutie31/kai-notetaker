@@ -4,11 +4,11 @@ slug: 20260805-083600_kai-notetaker
 project: kai-notetaker
 effort: deep
 effort_source: classifier
-phase: verify
+phase: execute
 progress: 40/93
 mode: interactive
 started: 2026-08-05T13:36:00Z
-updated: 2026-08-05T15:20:00Z
+updated: 2026-08-05T15:35:00Z
 ---
 
 ## Problem
@@ -353,6 +353,7 @@ Ship a Tauri desktop app whose Rust core has a working, unit-tested hash-chained
 - 2026-08-05 15:20: Advisor call (Rule 2, commitment-boundary) surfaced four real gaps, addressed as follows: (1) **audit-before-delete ordering bug** — `retention_sweep` originally deleted rows THEN wrote the audit entry; fixed to write the audit entry FIRST so a mid-sweep crash produces a visible "claimed deletion" rather than an invisible unlogged one. Tests re-run, still 17/17 passing. (2) **hash-chain overclaim risk** — added an explicit doc-comment limitation to `audit_log.rs`: the chain proves "not accidentally corrupted," not "cryptographically unforgeable by someone with disk access" (no external-keyed HMAC yet); a v2 hardening pass should anchor the chain to an OS-keychain-held key or head-hash. (3) **rusqlite feature-conflict risk** — checked via `cargo tree -i libsqlite3-sys -e features`; confirmed only one feature set (`bundled-sqlcipher-vendored-openssl` cascading to its own prerequisites) resolves in the graph, no conflict. (4) **BAA gate fail-closed** — already true and already tested (`blocked_by_default_with_no_baa_record`); no change needed, but noted that once a real egress path exists it should be re-verified the gate is actually called on that path, not just unit-tested in isolation.
 - 2026-08-05 15:20: Advisor also surfaced a gap OUTSIDE this ISA's scope that could NOT be resolved unilaterally: the OLD Bun/TS notetaker pipeline (`PAI/MEMORY/WORK/meeting-notetaker-agent/`, cron-scheduled every 5 minutes in `PULSE.toml`, auto-uploads screenshots/audio to OneDrive) has none of these gates and continues running in parallel with zero code changes this session. This is Jeremiah's decision to make (keep both running during a transition period vs. decommission the old pipeline now vs. some hybrid) — surfaced to him directly rather than acted on, since disabling a pipeline he currently relies on without his sign-off would be exactly the kind of unilateral action the "confirm before risky/hard-to-reverse actions" standing rule exists to prevent.
 - 2026-08-05 15:20: Retention's "hard-delete" (ISC-23) currently covers only SQLite rows, not the underlying audio/screenshot files on disk or their OneDrive copies (advisor's point: "the dominant retention surface is the files, not the DB rows"). This is a known gap for the AudioCapture feature (not yet built) to close — file-deletion-on-retention needs to be part of that feature's own ISC set, not retrofitted as an afterthought once files exist.
+- 2026-08-05 15:35: Rule 2a (Cato cross-vendor audit, mandatory at E4/E5) did not fire this session — two independent reasons, not one excuse standing in for the other: (1) `phase` was deliberately NOT set to `complete` this run (this is an ongoing project ISA with ~53 ISCs still pending across unbuilt Features; Rule 2a's literal trigger is "before setting phase: complete," which doesn't apply to a mid-stream `phase: execute` checkpoint), and (2) even if it had fired, Cato runs via `codex exec` (GPT-5.4), the same codex CLI already confirmed not installed in this environment (`reference_forge_codex_unavailable.md`) — identical blocker to the Forge skip logged earlier. Both reasons recorded so a future session doesn't assume Cato was silently forgotten.
 
 ## Changelog
 
