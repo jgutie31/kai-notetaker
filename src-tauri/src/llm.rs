@@ -51,8 +51,18 @@ pub enum LlmError {
 // `LlmEngine` borrows this same instance rather than owning one.
 static BACKEND: OnceLock<LlamaBackend> = OnceLock::new();
 
+// This module and `embeddings.rs` each keep their own `OnceLock` rather
+// than sharing one — safe because `LlamaBackend::init()`'s underlying
+// "initialized" guard is a single process-wide AtomicBool (confirmed in
+// the installed crate source): whichever module's OnceLock runs first
+// performs the real init, and the other's `unwrap_or` fallback constructs
+// the zero-field marker struct directly rather than treating the expected
+// `BackendAlreadyInitialized` as fatal. Both must use this same fallback
+// pattern — an earlier version of this function used `.expect()` here,
+// which panicked in exactly this cross-module scenario the first time
+// llm:: and embeddings:: tests ran in the same process.
 fn shared_backend() -> &'static LlamaBackend {
-    BACKEND.get_or_init(|| LlamaBackend::init().expect("llama backend init failed"))
+    BACKEND.get_or_init(|| LlamaBackend::init().unwrap_or(LlamaBackend {}))
 }
 
 pub struct LlmEngine {
@@ -133,6 +143,52 @@ impl LlmEngine {
 
         Ok(output)
     }
+
+    /// Split `text` into overlapping windows of real model tokens (not a
+    /// word-count approximation) — the chunk boundaries the Council plan
+    /// specified as ~2K tokens with 200-token overlap only mean something
+    /// if measured against the actual tokenizer the summarization step
+    /// will run through.
+    pub fn chunk_by_tokens(&self, text: &str, window_tokens: usize, overlap_tokens: usize) -> Result<Vec<String>, LlmError> {
+        let tokens = self
+            .model
+            .str_to_token(text, AddBos::Never)
+            .map_err(|e| LlmError::Tokenize(e.to_string()))?;
+
+        if tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+        if overlap_tokens >= window_tokens {
+            return Err(LlmError::Tokenize(format!(
+                "overlap_tokens ({overlap_tokens}) must be less than window_tokens ({window_tokens})"
+            )));
+        }
+
+        let stride = window_tokens - overlap_tokens;
+        let mut chunks = Vec::new();
+        let mut decoder = encoding_rs::UTF_8.new_decoder();
+        let mut start = 0usize;
+
+        while start < tokens.len() {
+            let end = (start + window_tokens).min(tokens.len());
+            let mut piece_text = String::new();
+            for token in &tokens[start..end] {
+                let piece = self
+                    .model
+                    .token_to_piece(*token, &mut decoder, true, None)
+                    .map_err(|e| LlmError::Decode(e.to_string()))?;
+                piece_text.push_str(&piece);
+            }
+            chunks.push(piece_text);
+
+            if end == tokens.len() {
+                break;
+            }
+            start += stride;
+        }
+
+        Ok(chunks)
+    }
 }
 
 #[cfg(test)]
@@ -164,6 +220,42 @@ mod tests {
             output.to_lowercase().contains("hello"),
             "expected 'hello' somewhere in output, got: {output:?}"
         );
+    }
+
+    #[test]
+    fn chunk_by_tokens_produces_overlapping_windows() {
+        let path = model_path();
+        if !path.exists() {
+            eprintln!("skipping: LLM model not present in this environment");
+            return;
+        }
+        let engine = LlmEngine::load(&path, 1000).unwrap();
+        let text = "word ".repeat(500); // enough tokens to force multiple small windows
+        let chunks = engine.chunk_by_tokens(&text, 50, 10).unwrap();
+
+        assert!(chunks.len() > 1, "expected multiple chunks for 500 repeated words at window=50");
+        // Verify real overlap: the tail of one chunk should share content
+        // with the head of the next, not just be adjacent non-overlapping
+        // slices.
+        for pair in chunks.windows(2) {
+            let (a, b) = (&pair[0], &pair[1]);
+            assert!(
+                a.trim_end().ends_with("word") && b.trim_start().starts_with("word"),
+                "expected overlapping 'word' content at chunk boundary"
+            );
+        }
+    }
+
+    #[test]
+    fn chunk_by_tokens_rejects_overlap_gte_window() {
+        let path = model_path();
+        if !path.exists() {
+            eprintln!("skipping: LLM model not present in this environment");
+            return;
+        }
+        let engine = LlmEngine::load(&path, 1000).unwrap();
+        let result = engine.chunk_by_tokens("some text here", 50, 50);
+        assert!(result.is_err());
     }
 
     #[test]

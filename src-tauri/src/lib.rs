@@ -3,8 +3,11 @@ mod audio_capture;
 mod audit_log;
 mod cloud_sync_gate;
 mod diarization;
+mod embeddings;
+mod frontier;
 mod llm;
 mod retention;
+mod summarization;
 
 use audit_log::AuditLog;
 use retention::RetentionPolicy;

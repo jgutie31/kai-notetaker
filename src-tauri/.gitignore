@@ -11,6 +11,7 @@
 /models/*.gguf
 /models/diarization/
 /models/llm/
+/models/embeddings/
 
 # Local test fixture audio (generated via macOS `say`, not source-controlled)
 /test-fixtures/*.wav

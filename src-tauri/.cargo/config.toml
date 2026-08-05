@@ -1,0 +1,11 @@
+# This project loads multiple GPU-accelerated ML models (Whisper, pyannote
+# diarization, an 8B LLM, a BGE embedding model) in its test suite. On a
+# 16GB machine, cargo test's default parallel test execution can cause
+# real Metal/memory contention — confirmed 2026-08-05: the same test suite
+# passed 42/42 single-threaded and showed one transient failure in the
+# heaviest test (full summarization pipeline) under default parallelism.
+# Forcing single-threaded test execution trades test wall-clock time for
+# reliability, which is the right tradeoff for a resource-constrained dev
+# machine running real models rather than mocks.
+[env]
+RUST_TEST_THREADS = "1"
