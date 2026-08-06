@@ -5,10 +5,10 @@ project: kai-notetaker
 effort: deep
 effort_source: classifier
 phase: execute
-progress: 80/104
+progress: 87/115
 mode: interactive
 started: 2026-08-05T13:36:00Z
-updated: 2026-08-05T22:15:00Z
+updated: 2026-08-05T22:45:00Z
 ---
 
 ## Problem
@@ -176,6 +176,23 @@ Ship a Tauri desktop app whose Rust core has a working, unit-tested hash-chained
 - [x] ISC-102: The four heavy models load exactly once, in a background OS thread at app startup, not blocking window appearance and not reloaded per-recording (probe: live log line `all pipeline engines loaded and ready` confirmed this session; `stop_recording`'s background thread waits on the shared `Arc<Mutex<Option<Arc<PipelineEngines>>>>` rather than loading its own copies).
 - [x] ISC-103: Meeting Library screen lists real persisted meetings (title, date, duration, status) and polls every 4s so a `processing` row flips to `ready` without a manual refresh (probe: code review of `MeetingLibrary.tsx`; no automated frontend test written this pass).
 - [x] ISC-104: Meeting Detail screen displays real transcript (speaker-labeled, timestamped), summary, and action items for a selected meeting, polling until processing completes (probe: code review of `MeetingDetail.tsx`; no automated frontend test written this pass).
+
+### InstallerFirstRun
+
+- [x] ISC-105: A function exists that reports which of the 5 local models are missing from disk (probe: `cargo test model_provisioning::missing_models`).
+- [x] ISC-106: Every model download URL is byte-verified against the real file already on disk before being trusted, not assumed from filename alone (probe: `curl -sIL` content-length matched `stat -f%z` for all 5 during BUILD — recorded in Changelog).
+- [x] ISC-107: A download writes to a temp path and only lands at the final destination on full success — a crash/interrupt never leaves a partial file that looks present (probe: `download_model`'s `.download-tmp` + rename-on-success code path).
+- [x] ISC-108: Engine loading at app startup resolves models from a runtime-real directory (`$APPDATA/models`), not a build-time-only path that wouldn't exist on an installed end-user machine (probe: `resolve_models_dir`; `grep -n "CARGO_MANIFEST_DIR" src/lib.rs` shows zero remaining runtime uses outside the dev-fallback branch).
+- [x] ISC-109: The frontend shows a real per-model progress bar (bytes downloaded / total) during first-run download, not just a spinner (probe: `FirstRunSetup.tsx`, `model-download-progress` event payload includes `downloaded`/`total`).
+- [ ] ISC-110: Anti: the installer never bundles the ~5.5GB of models into the app installer itself (probe: `du -sh` on the built `.dmg`/`.app` bundle stays well under 1GB — DEFERRED-VERIFY, no release build produced this session, follow-up task: verify at first real `tauri build`).
+- [DEFERRED-VERIFY] ISC-111: A real end-to-end first-run download (not just unit tests) succeeds on a machine with zero models present (probe: delete `$APPDATA/models`, launch the built app, confirm all 5 download and engines subsequently load — not run this session since it would force re-downloading ~5.5GB already present locally; follow-up task before shipping to Nesta/Paula/contractors).
+
+### MeetingImport (old cron migration)
+
+- [x] ISC-112: The WAV reader feeding the pipeline accepts any real mono sample rate, not only the live recorder's own 48kHz (probe: `read_wav_mono_resampled_accepts_a_real_16k_fixture`).
+- [ ] ISC-113: All real recordings from the old cron's `recordings/` directory (audio only, never the sibling `screenshots/` directory) are imported and reach `ready` status in the new app (probe: `import_legacy_recordings` example's own summary line, `N succeeded, 0 failed` — IN PROGRESS this session, not yet complete).
+- [ ] ISC-114: The old `meeting-watcher` PULSE.toml cron job is disabled only after ISC-113 passes, never before (probe: `enabled = false` in PULSE.toml's `meeting-watcher` job, `git log` timestamp ordering shows it postdates the import's success confirmation).
+- [x] ISC-115: Anti: the import never runs concurrently with the live app against the same database/audit-log files (probe: this session's Decisions log — dev app process stopped before the import ran, restarted only after).
 
 ### UI/UX (deferred until hard gates pass — placeholder ISCs for the eventual ideal state)
 
@@ -356,6 +373,18 @@ Ship a Tauri desktop app whose Rust core has a working, unit-tested hash-chained
   satisfies: [ISC-89, ISC-90, ISC-91, ISC-92, ISC-93]
   depends_on: [AuditLogGate, RetentionGate, CloudSyncGate]
   parallelizable: true
+
+- name: InstallerFirstRun
+  description: First-run download of the 5 local models with a real progress screen, not manual curl
+  satisfies: [ISC-105, ISC-106, ISC-107, ISC-108, ISC-109, ISC-110, ISC-111]
+  depends_on: [LocalLlmPipeline, DiarizationPipeline, AsrPipeline]
+  parallelizable: false
+
+- name: MeetingImport
+  description: One-off migration of the old screenshot-based notetaker's real audio into this app
+  satisfies: [ISC-112, ISC-113, ISC-114, ISC-115]
+  depends_on: [StorageLayer, LocalLlmPipeline]
+  parallelizable: false
 ```
 
 ## Decisions
@@ -385,7 +414,10 @@ Ship a Tauri desktop app whose Rust core has a working, unit-tested hash-chained
 - 2026-08-05 21:30 (commit d81ca5e): Added audio playback to Meeting Detail, per Jeremiah's request ("Is the actual audio not going to be part of that summarized page?"). Uses Tauri's asset protocol (`assetProtocol.enable` + scope `$APPDATA/recordings/*`) + `convertFileSrc`. Known, disclosed limitation: no real HTTP range-request support for scrubbing very large files (upstream Tauri limitation, not something this app's code can fix).
 - 2026-08-05 21:45 (commit 1079be1): Built bidirectional transcript-audio sync per Jeremiah's request — auto-scroll follows the active transcript segment during playback (fires only on active-index change, not every `timeupdate` tick, so it doesn't fight a user who scrolled ahead to read); clicking any transcript line seeks the audio to that segment's start time. Confirmed working by Jeremiah ("Yes it works. Great.").
 - 2026-08-05 22:00 (commits 3f3eac7, 506c150): Two layout requests, same session. First: split Meeting Detail so only the transcript region scrolls, not the whole page (`.detail-screen__top` fixed height, `.detail-screen__transcript` independently `overflow-y: auto`). Immediately followed by a second, related request: make that split boundary itself freely draggable. Built via pointer-events drag (not mouse events — better multi-input support), with the top section's height stored in React state and clamped between `MIN_TOP_HEIGHT`/`MIN_TRANSCRIPT_HEIGHT` so neither pane can be dragged to zero. Reads real layout measurements (`getBoundingClientRect()`) at drag-start rather than assuming a fixed window size, so clamping stays correct across window resizes.
-- 2026-08-05 22:15 (this session, SQLCipher): Load-bearing fact verified BEFORE writing any real code (not assumed): built a standalone `cargo run --example` scratch test proving the `bundled-sqlcipher-vendored-openssl` feature actually compiles working SQLCipher (not a no-op) — correct key round-trips real data, wrong key fails to read, and a raw byte-scan of the file confirms no plaintext leakage. Key is generated (32 random bytes via `getrandom::fill`, NOT derived from a passphrase — avoids weak-password risk entirely) and stored in the macOS Keychain via `security-framework`'s `passwords::{get_generic_password, set_generic_password}`, cached process-wide in a `static OnceLock` so the Keychain isn't queried on every single Tauri command (each command opens its own connection). `security-framework`'s real resolved version was 3.7.0, not the 2.x assumed from memory — verified its actual `passwords.rs`/`base.rs` source directly before use, per this project's established discipline of never trusting assumed crate APIs (same lesson as cpal/whisper-rs/llama-cpp-2 earlier). A pre-existing dev-era plaintext DB (Jeremiah's own test data from this same session) is detected before SQLCipher ever touches it and archived (renamed with a `.pre-encryption-backup-<timestamp>` suffix, including `-wal`/`-shm` sidecars) rather than corrupted — same dev-only-safe discipline already established by `reset_if_schema_outdated`.
+- 2026-08-05 22:15 (this session, SQLCipher): Load-bearing fact verified BEFORE writing any real code (not assumed): built a standalone `cargo run --example` scratch test proving the `bundled-sqlcipher-vendored-openssl` feature actually compiles working SQLCipher (not a no-op) — correct key round-trips real data, wrong key fails to read, and a raw byte-scan of the file confirms no plaintext leakage. Key is generated (32 random bytes via `getrandom::fill`, NOT derived from a passphrase — avoids weak-password risk entirely) and stored in the macOS Keychain via `security-framework`'s `passwords::{get_generic_password, set_generic_password}`, cached process-wide in a `static OnceLock` so the Keychain isn't queried on every single Tauri command (each command opens its own connection). `security-framework`'s real resolved version was 3.7.0, not the 2.x assumed from memory — verified its actual `passwords.rs`/`base.rs` source directly before use, per this project's established discipline of never trusting assumed crate APIs (same lesson as cpal/whisper-rs/llama-cpp-2 earlier). A pre-existing dev-era plaintext DB (Jeremiah's own test data from this same session) is detected before SQLCipher ever touches it and archived (renamed with a `.pre-encryption-backup-<timestamp>` suffix, including `-wal`/`-shm` sidecars) rather than corrupted — same dev-only-safe discipline already established by `reset_if_schema_outdated`. **Real-world confirmation, not just tests:** Tauri's dev-mode file watcher auto-rebuilt and relaunched the actual running app after this commit; Jeremiah's real dev-era database was correctly detected as plaintext and archived, and the real on-disk file is now confirmed unreadable by a plain `sqlite3` CLI (`file is not a database`) — encryption is live in the actual app, not just proven in isolated tests.
+- 2026-08-05 22:30 (this session, installer + import prep): Building the installer surfaced a real, separate pre-existing gap: engine loading at app startup was hardcoded to `env!("CARGO_MANIFEST_DIR")`, a path baked in at BUILD time on the dev machine — this would resolve to a nonexistent directory on Nesta's, Paula's, or any contractor's installed machine. Fixed via `resolve_models_dir()`: production path is always `$APPDATA/models` (what the installer populates); dev builds fall back to the source-tree `models/` directory only when `$APPDATA/models` is empty and the dev copy is complete, so this machine's already-downloaded ~5.3GB of models never needs re-fetching. `cfg!(debug_assertions)` gates the fallback off entirely in release builds.
+- 2026-08-05 22:30 (this session, installer): Several internal modules (`asr`, `audit_log`, `diarization`, `embeddings`, `llm`, `pipeline`, `storage`) changed from `mod` to `pub mod` so `examples/import_legacy_recordings.rs` can use them — examples compile as an external consumer of the lib crate, not as part of it, so private items aren't visible to them regardless of same-repo location.
+- 2026-08-05 22:45 (this session, MeetingImport): Before running the real import against Jeremiah's actual recordings (including two genuine KCG client-related meetings — a PCI-DSS assessment call and a strategy call), inspected `audit_log.rs::append()` and found it does an unsynchronized read-then-write of the hash chain's tip with no file locking. Two processes appending concurrently (the live running dev app + a separate import binary) could race and produce a forked chain. Rather than add file-locking machinery for a one-off migration, stopped the running dev app first (`kill` on the `target/debug/kai-notetaker` PID, dev frontend/vite process left running), ran the import standalone, and will restart the dev app only once the import fully completes. Documented as ISC-115 (anti-criterion).
 
 ## Changelog
 
@@ -419,3 +451,11 @@ Ship a Tauri desktop app whose Rust core has a working, unit-tested hash-chained
 - ISC-38 (encryption is real, not theater): `cargo test --lib storage::` → `open_connection_actually_encrypts_the_database_file ... ok` — writes a real audio path string, reads the raw file bytes back, asserts the plaintext string is NOT present anywhere in the file.
 - Legacy-plaintext safety: `cargo test --lib storage::` → `legacy_plaintext_database_is_archived_not_corrupted ... ok` — a pre-existing plain (un-keyed) database with real data is archived to a `.pre-encryption-backup-<timestamp>` file, and a fresh encrypted database (confirmed empty via `list_meetings`) takes over the original path.
 - **Full suite after SQLCipher wiring:** `cargo test --lib` → `test result: ok. 61 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 366.04s` (includes real GPU-accelerated model-loading integration tests, confirming the encryption change didn't regress anything else). `cargo build` → real Mach-O arm64 binary produced at `target/debug/kai-notetaker`.
+- ISC-105/107: `cargo test --lib model_provisioning::` → `missing_models_reports_all_five_for_an_empty_directory ... ok`, `missing_models_is_empty_once_every_file_exists ... ok`.
+- ISC-106: real `curl -sIL` HEAD requests against all 5 candidate URLs, `content-length` compared byte-for-byte against `stat -f%z` on the real local files — all 5 matched exactly (Whisper 147951465, diarization segmentation archive 6958444, speaker-embedding 29596978, LLM 4920739232, embeddings 67308128).
+- ISC-108: `cargo test --lib model_provisioning::resolve_models_dir_prefers_dev_source_tree_when_appdata_is_empty ... ok`; `grep -n "CARGO_MANIFEST_DIR" src-tauri/src/lib.rs` shows zero remaining matches (moved entirely into `model_provisioning::resolve_models_dir`'s dev-only fallback branch).
+- ISC-109: `grep -n "downloaded.*total" src/components/FirstRunSetup.tsx` shows the progress bar's width is computed from the real `model-download-progress` event payload's `downloaded`/`total` fields, not a fake/simulated percentage.
+- **Full suite after installer wiring:** `cargo test --lib` → `test result: ok. 65 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 72.98s`. `cargo build` → clean. `bunx tsc --noEmit` → exit 0.
+- ISC-112: `cargo test --lib pipeline::read_wav_mono_resampled_accepts_a_real_16k_fixture ... ok` — real 16kHz fixture read and confirmed pass-through unchanged (no resampling artifact) since it's already at `PIPELINE_SAMPLE_RATE`.
+- ISC-113: import in progress — `cargo run --example import_legacy_recordings`, backgrounded (two of the six real recordings — the 43-minute and 21.7-minute meetings — dominate wall-clock time). Interim real progress captured via the job's own log: 2/6 completed (`OK: 2026-08-01T04-12-40-450Z-teams-call -> meeting_id=1, duration=149s`; `OK: 2026-08-01T04-20-38-748Z-call-at-11-19-pm -> meeting_id=2, duration=278s`), 3rd (`FwPicDssAssessment`) in progress at time of this note. Full pass/fail summary to be recorded once the job completes.
+- ISC-115: real process list (`ps aux`) confirmed only one `target/debug/kai-notetaker` process before the import started; that process was killed (verified absent via a second `ps aux` check) before `cargo run --example import_legacy_recordings` began.
