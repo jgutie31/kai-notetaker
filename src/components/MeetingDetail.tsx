@@ -4,6 +4,7 @@ import "./MeetingDetail.css";
 
 interface TranscriptSegmentRow {
   speaker: number | null;
+  speaker_label: string | null;
   start_ms: number;
   end_ms: number;
   text: string;
@@ -69,6 +70,11 @@ export function MeetingDetail({ meetingId, onBack, onDelete }: MeetingDetailProp
   const [isResizing, setIsResizing] = useState(false);
   const [isEditingTitle, setIsEditingTitle] = useState(false);
   const [titleDraft, setTitleDraft] = useState("");
+  const [knownSpeakers, setKnownSpeakers] = useState<string[]>([]);
+  const [editingSpeakerIndex, setEditingSpeakerIndex] = useState<number | null>(null);
+  const [speakerNameDraft, setSpeakerNameDraft] = useState("");
+  const [rememberSpeaker, setRememberSpeaker] = useState(true);
+  const [labelingInFlight, setLabelingInFlight] = useState(false);
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const segmentRefs = useRef<(HTMLDivElement | null)[]>([]);
@@ -100,6 +106,10 @@ export function MeetingDetail({ meetingId, onBack, onDelete }: MeetingDetailProp
       if (interval) clearInterval(interval);
     };
   }, [meetingId]);
+
+  useEffect(() => {
+    invoke<string[]>("list_known_speakers").then(setKnownSpeakers).catch(() => {});
+  }, []);
 
   const activeIndex = useMemo(
     () => (detail ? findActiveSegmentIndex(detail.transcript, currentTimeMs) : -1),
@@ -143,6 +153,42 @@ export function MeetingDetail({ meetingId, onBack, onDelete }: MeetingDetailProp
         onBack();
       })
       .catch((e) => setError(String(e)));
+  };
+
+  const startEditingSpeaker = (e: React.MouseEvent, seg: TranscriptSegmentRow) => {
+    e.stopPropagation();
+    if (seg.speaker === null) return;
+    setEditingSpeakerIndex(seg.speaker);
+    setSpeakerNameDraft(seg.speaker_label ?? "");
+    setRememberSpeaker(true);
+  };
+
+  const commitSpeakerLabel = () => {
+    if (!detail || editingSpeakerIndex === null) return;
+    const name = speakerNameDraft.trim();
+    const speakerIndex = editingSpeakerIndex;
+    if (!name) {
+      setEditingSpeakerIndex(null);
+      return;
+    }
+    setLabelingInFlight(true);
+    invoke("label_meeting_speaker", { meetingId: detail.id, speakerIndex, name, remember: rememberSpeaker })
+      .then(() => {
+        setDetail((prev) =>
+          prev
+            ? {
+                ...prev,
+                transcript: prev.transcript.map((s) => (s.speaker === speakerIndex ? { ...s, speaker_label: name } : s)),
+              }
+            : prev,
+        );
+        if (rememberSpeaker && !knownSpeakers.includes(name)) {
+          setKnownSpeakers((prev) => [...prev, name].sort());
+        }
+        setEditingSpeakerIndex(null);
+      })
+      .catch((e) => setError(String(e)))
+      .finally(() => setLabelingInFlight(false));
   };
 
   // Free-drag resize between the fixed top section and the transcript pane.
@@ -336,17 +382,51 @@ export function MeetingDetail({ meetingId, onBack, onDelete }: MeetingDetailProp
                 }`}
                 onClick={() => detail.audio_path && seekTo(seg.start_ms)}
               >
-                <span className="transcript-line__speaker">
-                  {seg.speaker !== null ? `Speaker ${seg.speaker}` : "—"}
-                  <br />
-                  {formatTimestamp(seg.start_ms)}
-                </span>
+                {editingSpeakerIndex === seg.speaker ? (
+                  <span className="transcript-line__speaker-edit" onClick={(e) => e.stopPropagation()}>
+                    <input
+                      type="text"
+                      autoFocus
+                      list="known-speakers-list"
+                      className="transcript-line__speaker-input"
+                      placeholder="Name"
+                      value={speakerNameDraft}
+                      onChange={(e) => setSpeakerNameDraft(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") commitSpeakerLabel();
+                        if (e.key === "Escape") setEditingSpeakerIndex(null);
+                      }}
+                    />
+                    <label className="transcript-line__speaker-remember">
+                      <input type="checkbox" checked={rememberSpeaker} onChange={(e) => setRememberSpeaker(e.target.checked)} />
+                      Remember
+                    </label>
+                    <button type="button" disabled={labelingInFlight} onClick={commitSpeakerLabel}>
+                      Save
+                    </button>
+                  </span>
+                ) : (
+                  <span
+                    className="transcript-line__speaker transcript-line__speaker--editable"
+                    onClick={(e) => startEditingSpeaker(e, seg)}
+                    title="Click to name this speaker"
+                  >
+                    {seg.speaker_label ?? (seg.speaker !== null ? `Speaker ${seg.speaker}` : "—")}
+                    <br />
+                    {formatTimestamp(seg.start_ms)}
+                  </span>
+                )}
                 <span className="transcript-line__text">{seg.text}</span>
               </div>
             ))}
           </div>
         </>
       )}
+      <datalist id="known-speakers-list">
+        {knownSpeakers.map((name) => (
+          <option key={name} value={name} />
+        ))}
+      </datalist>
     </div>
   );
 }

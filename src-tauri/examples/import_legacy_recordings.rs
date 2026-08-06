@@ -13,6 +13,7 @@ use kai_notetaker_lib::diarization::DiarizationEngine;
 use kai_notetaker_lib::embeddings::EmbeddingEngine;
 use kai_notetaker_lib::llm::LlmEngine;
 use kai_notetaker_lib::pipeline::{self, PipelineEngines};
+use kai_notetaker_lib::speaker_id::SpeakerIdEngine;
 use kai_notetaker_lib::storage;
 use std::path::PathBuf;
 
@@ -110,6 +111,10 @@ fn main() {
         conn.execute("DELETE FROM meeting_summaries WHERE meeting_id = ?1", [meeting_id]).unwrap();
         conn.execute("DELETE FROM action_items WHERE meeting_id = ?1", [meeting_id]).unwrap();
         conn.execute("DELETE FROM meeting_embeddings WHERE meeting_id = ?1", [meeting_id]).unwrap();
+        // Old diarization runs can assign different speaker indices than the new run —
+        // stale labels keyed on (meeting_id, speaker_index) would otherwise attach to
+        // the wrong voice after reprocessing.
+        conn.execute("DELETE FROM meeting_speaker_labels WHERE meeting_id = ?1", [meeting_id]).unwrap();
         conn.execute("UPDATE meetings SET status = 'processing', title = NULL WHERE id = ?1", [meeting_id]).unwrap();
 
         println!("loading engines (this takes a while — 4 real models)...");
@@ -125,6 +130,8 @@ fn main() {
                 .expect("load LLM"),
             embedding: EmbeddingEngine::load(&manifest_dir.join("models/embeddings/bge-small-en-v1.5-f16.gguf"))
                 .expect("load embeddings"),
+            speaker_id: SpeakerIdEngine::load(&manifest_dir.join("models/diarization/speaker-embedding.onnx"))
+                .expect("load speaker id engine"),
         };
         println!("engines loaded. reprocessing meeting_id={meeting_id} ({audio_path})...");
 
@@ -151,6 +158,8 @@ fn main() {
             .expect("load LLM"),
         embedding: EmbeddingEngine::load(&manifest_dir.join("models/embeddings/bge-small-en-v1.5-f16.gguf"))
             .expect("load embeddings"),
+        speaker_id: SpeakerIdEngine::load(&manifest_dir.join("models/diarization/speaker-embedding.onnx"))
+            .expect("load speaker id engine"),
     };
     println!("engines loaded.");
 
@@ -185,6 +194,7 @@ fn main() {
         conn.execute("DELETE FROM meeting_summaries WHERE meeting_id = ?1", [id]).unwrap();
         conn.execute("DELETE FROM action_items WHERE meeting_id = ?1", [id]).unwrap();
         conn.execute("DELETE FROM meeting_embeddings WHERE meeting_id = ?1", [id]).unwrap();
+        conn.execute("DELETE FROM meeting_speaker_labels WHERE meeting_id = ?1", [id]).unwrap();
         conn.execute("DELETE FROM meetings WHERE id = ?1", [id]).unwrap();
     }
 

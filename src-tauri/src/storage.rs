@@ -186,6 +186,28 @@ pub fn ensure_schema(conn: &Connection) -> Result<(), StorageError> {
             chunk_text TEXT NOT NULL,
             vector BLOB NOT NULL,
             FOREIGN KEY(meeting_id) REFERENCES meetings(id)
+         );
+         CREATE TABLE IF NOT EXISTS known_speakers (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS known_speaker_embeddings (
+            id INTEGER PRIMARY KEY,
+            known_speaker_id INTEGER NOT NULL,
+            embedding BLOB NOT NULL,
+            source_meeting_id INTEGER,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(known_speaker_id) REFERENCES known_speakers(id)
+         );
+         CREATE TABLE IF NOT EXISTS meeting_speaker_labels (
+            meeting_id INTEGER NOT NULL,
+            speaker_index INTEGER NOT NULL,
+            known_speaker_id INTEGER,
+            label TEXT,
+            PRIMARY KEY(meeting_id, speaker_index),
+            FOREIGN KEY(meeting_id) REFERENCES meetings(id),
+            FOREIGN KEY(known_speaker_id) REFERENCES known_speakers(id)
          );",
     )?;
     apply_column_migrations(conn)?;
@@ -278,13 +300,105 @@ pub fn insert_action_item(
     Ok(())
 }
 
+fn f32_vec_to_bytes(vector: &[f32]) -> Vec<u8> {
+    vector.iter().flat_map(|f| f.to_le_bytes()).collect()
+}
+
+fn bytes_to_f32_vec(bytes: &[u8]) -> Vec<f32> {
+    bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+}
+
 pub fn insert_embedding(conn: &Connection, meeting_id: i64, chunk_text: &str, vector: &[f32]) -> Result<(), StorageError> {
-    let bytes: Vec<u8> = vector.iter().flat_map(|f| f.to_le_bytes()).collect();
     conn.execute(
         "INSERT INTO meeting_embeddings (meeting_id, chunk_text, vector) VALUES (?1, ?2, ?3)",
-        rusqlite::params![meeting_id, chunk_text, bytes],
+        rusqlite::params![meeting_id, chunk_text, f32_vec_to_bytes(vector)],
     )?;
     Ok(())
+}
+
+/// Gets the existing known-speaker row by name, or creates one. Real
+/// person identity is name-keyed (unique), separate from any one
+/// meeting's raw diarization index — the same person can be "Speaker 2"
+/// in one meeting and "Speaker 0" in another.
+pub fn get_or_create_known_speaker(conn: &Connection, name: &str) -> Result<i64, StorageError> {
+    if let Ok(id) = conn.query_row("SELECT id FROM known_speakers WHERE name = ?1", [name], |r| r.get(0)) {
+        return Ok(id);
+    }
+    conn.execute(
+        "INSERT INTO known_speakers (name, created_at) VALUES (?1, datetime('now'))",
+        [name],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Stores one more voice sample for a known speaker — multiple samples
+/// per person (across meetings) make future matching more robust than a
+/// single embedding ever could.
+pub fn add_speaker_embedding_sample(
+    conn: &Connection,
+    known_speaker_id: i64,
+    embedding: &[f32],
+    source_meeting_id: Option<i64>,
+) -> Result<(), StorageError> {
+    conn.execute(
+        "INSERT INTO known_speaker_embeddings (known_speaker_id, embedding, source_meeting_id, created_at)
+         VALUES (?1, ?2, ?3, datetime('now'))",
+        rusqlite::params![known_speaker_id, f32_vec_to_bytes(embedding), source_meeting_id],
+    )?;
+    Ok(())
+}
+
+/// Every stored voice sample across all known speakers, as (name,
+/// embedding) pairs — the real source of truth for rebuilding an
+/// in-memory `SpeakerEmbeddingManager` at app startup (the manager itself
+/// has no persistence of its own).
+pub fn load_all_speaker_embeddings(conn: &Connection) -> Result<Vec<(String, Vec<f32>)>, StorageError> {
+    let mut stmt = conn.prepare(
+        "SELECT ks.name, kse.embedding FROM known_speaker_embeddings kse
+         JOIN known_speakers ks ON ks.id = kse.known_speaker_id",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        let name: String = row.get(0)?;
+        let bytes: Vec<u8> = row.get(1)?;
+        Ok((name, bytes_to_f32_vec(&bytes)))
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(StorageError::from)
+}
+
+/// Sets (upserts) the display label for one raw diarization speaker
+/// index within one meeting — either a link to a known, named person, or
+/// just a one-off text label with no persistent identity attached.
+pub fn label_meeting_speaker(
+    conn: &Connection,
+    meeting_id: i64,
+    speaker_index: i32,
+    known_speaker_id: Option<i64>,
+    label: &str,
+) -> Result<(), StorageError> {
+    conn.execute(
+        "INSERT INTO meeting_speaker_labels (meeting_id, speaker_index, known_speaker_id, label)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(meeting_id, speaker_index) DO UPDATE SET known_speaker_id = ?3, label = ?4",
+        rusqlite::params![meeting_id, speaker_index, known_speaker_id, label],
+    )?;
+    Ok(())
+}
+
+/// The resolved speaker_index -> display_label map for one meeting —
+/// used both to render real names in the UI and to build the
+/// LLM-facing labeled transcript with real names instead of "Speaker N".
+pub fn get_meeting_speaker_labels(conn: &Connection, meeting_id: i64) -> Result<std::collections::HashMap<i32, String>, StorageError> {
+    let mut stmt = conn.prepare(
+        "SELECT speaker_index, label FROM meeting_speaker_labels WHERE meeting_id = ?1",
+    )?;
+    let rows = stmt.query_map([meeting_id], |row| Ok((row.get::<_, i32>(0)?, row.get::<_, String>(1)?)))?;
+    rows.collect::<Result<std::collections::HashMap<_, _>, _>>().map_err(StorageError::from)
+}
+
+pub fn list_known_speakers(conn: &Connection) -> Result<Vec<(i64, String)>, StorageError> {
+    let mut stmt = conn.prepare("SELECT id, name FROM known_speakers ORDER BY name")?;
+    let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(StorageError::from)
 }
 
 pub fn rename_meeting(conn: &Connection, meeting_id: i64, title: &str) -> Result<(), StorageError> {
@@ -344,6 +458,10 @@ pub fn list_meetings(conn: &Connection) -> Result<Vec<MeetingListItem>, StorageE
 #[derive(Debug, Clone, Serialize)]
 pub struct TranscriptSegmentRow {
     pub speaker: Option<i32>,
+    /// Resolved display name for `speaker`, if this meeting's speaker
+    /// index has been labeled (auto-matched or manually assigned).
+    /// `None` means the frontend should fall back to "Speaker N".
+    pub speaker_label: Option<String>,
     pub start_ms: i64,
     pub end_ms: i64,
     pub text: String,
@@ -387,13 +505,17 @@ pub fn get_meeting_detail(conn: &Connection, meeting_id: i64) -> Result<MeetingD
         )
         .ok();
 
+    let speaker_labels = get_meeting_speaker_labels(conn, meeting_id)?;
+
     let mut stmt = conn.prepare(
         "SELECT speaker, start_ms, end_ms, text FROM transcript_segments WHERE meeting_id = ?1 ORDER BY segment_index ASC",
     )?;
     let transcript = stmt
         .query_map([meeting_id], |row| {
+            let speaker: Option<i32> = row.get(0)?;
             Ok(TranscriptSegmentRow {
-                speaker: row.get(0)?,
+                speaker,
+                speaker_label: speaker.and_then(|s| speaker_labels.get(&s).cloned()),
                 start_ms: row.get(1)?,
                 end_ms: row.get(2)?,
                 text: row.get(3)?,
@@ -672,5 +794,78 @@ mod tests {
         let id = create_meeting(&conn, "a.wav", 5).unwrap();
         delete_meeting(&conn, id).unwrap();
         assert!(list_meetings(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn get_or_create_known_speaker_is_idempotent_by_name() {
+        let conn = test_db();
+        let id1 = get_or_create_known_speaker(&conn, "Jeremiah").unwrap();
+        let id2 = get_or_create_known_speaker(&conn, "Jeremiah").unwrap();
+        assert_eq!(id1, id2, "the same name should resolve to the same known_speaker row");
+
+        let id3 = get_or_create_known_speaker(&conn, "Nesta").unwrap();
+        assert_ne!(id1, id3);
+    }
+
+    #[test]
+    fn speaker_embedding_samples_round_trip_through_storage() {
+        let conn = test_db();
+        let speaker_id = get_or_create_known_speaker(&conn, "Jeremiah").unwrap();
+        let embedding = vec![0.1_f32, -0.2, 0.3, 0.4];
+        add_speaker_embedding_sample(&conn, speaker_id, &embedding, Some(1)).unwrap();
+
+        let all = load_all_speaker_embeddings(&conn).unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].0, "Jeremiah");
+        assert_eq!(all[0].1, embedding, "float bytes must round-trip exactly through the BLOB encoding");
+    }
+
+    #[test]
+    fn label_meeting_speaker_upserts_and_resolves_in_meeting_detail() {
+        let conn = test_db();
+        let meeting_id = create_meeting(&conn, "a.wav", 10).unwrap();
+        mark_meeting_ready(&conn, meeting_id, "Real Meeting").unwrap();
+        insert_transcript_segment(&conn, meeting_id, 0, Some(0), 0, 1000, "hello").unwrap();
+        insert_transcript_segment(&conn, meeting_id, 1, Some(1), 1000, 2000, "hi there").unwrap();
+
+        let jeremiah_id = get_or_create_known_speaker(&conn, "Jeremiah").unwrap();
+        label_meeting_speaker(&conn, meeting_id, 0, Some(jeremiah_id), "Jeremiah").unwrap();
+        label_meeting_speaker(&conn, meeting_id, 1, None, "Unknown caller").unwrap();
+
+        let detail = get_meeting_detail(&conn, meeting_id).unwrap();
+        assert_eq!(detail.transcript[0].speaker_label.as_deref(), Some("Jeremiah"));
+        assert_eq!(detail.transcript[1].speaker_label.as_deref(), Some("Unknown caller"));
+
+        // Upsert: relabeling the same (meeting, speaker_index) updates in place.
+        label_meeting_speaker(&conn, meeting_id, 0, Some(jeremiah_id), "J. Gutierrez").unwrap();
+        let updated = get_meeting_detail(&conn, meeting_id).unwrap();
+        assert_eq!(updated.transcript[0].speaker_label.as_deref(), Some("J. Gutierrez"));
+        assert_eq!(
+            get_meeting_speaker_labels(&conn, meeting_id).unwrap().len(),
+            2,
+            "relabeling should update the existing row, not add a duplicate"
+        );
+    }
+
+    #[test]
+    fn unlabeled_speaker_falls_back_to_none() {
+        let conn = test_db();
+        let meeting_id = create_meeting(&conn, "a.wav", 10).unwrap();
+        mark_meeting_ready(&conn, meeting_id, "Real Meeting").unwrap();
+        insert_transcript_segment(&conn, meeting_id, 0, Some(0), 0, 1000, "hello").unwrap();
+
+        let detail = get_meeting_detail(&conn, meeting_id).unwrap();
+        assert_eq!(detail.transcript[0].speaker_label, None);
+    }
+
+    #[test]
+    fn list_known_speakers_returns_all_enrolled_names_sorted() {
+        let conn = test_db();
+        get_or_create_known_speaker(&conn, "Nesta").unwrap();
+        get_or_create_known_speaker(&conn, "Dave").unwrap();
+        get_or_create_known_speaker(&conn, "Jeremiah").unwrap();
+
+        let names: Vec<String> = list_known_speakers(&conn).unwrap().into_iter().map(|(_, n)| n).collect();
+        assert_eq!(names, vec!["Dave", "Jeremiah", "Nesta"]);
     }
 }

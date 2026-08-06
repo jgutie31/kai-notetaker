@@ -14,6 +14,7 @@ pub mod llm;
 pub mod model_provisioning;
 pub mod pipeline;
 mod retention;
+pub mod speaker_id;
 pub mod storage;
 mod summarization;
 
@@ -48,7 +49,7 @@ struct AppPaths {
 /// (models already present) and by `download_missing_models` (models
 /// just finished downloading) — both cases converge on the same
 /// "models are on disk now, go load them" moment.
-fn spawn_engine_loading(models_dir: PathBuf, engines_state: Arc<Mutex<Option<Arc<PipelineEngines>>>>) {
+fn spawn_engine_loading(models_dir: PathBuf, data_dir: PathBuf, engines_state: Arc<Mutex<Option<Arc<PipelineEngines>>>>) {
     std::thread::spawn(move || {
         if !model_provisioning::missing_models(&models_dir).is_empty() {
             println!("models not yet provisioned — waiting for first-run download to complete");
@@ -86,8 +87,21 @@ fn spawn_engine_loading(models_dir: PathBuf, engines_state: Arc<Mutex<Option<Arc
                 return;
             }
         };
+        let speaker_id = match speaker_id::SpeakerIdEngine::load(&models_dir.join("diarization/speaker-embedding.onnx")) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("failed to load speaker id engine: {e}");
+                return;
+            }
+        };
+        match storage::open_connection(&data_dir.join("kai-notetaker.sqlite3"))
+            .and_then(|conn| storage::load_all_speaker_embeddings(&conn))
+        {
+            Ok(samples) => speaker_id.enroll_from_storage(&samples),
+            Err(e) => eprintln!("failed to load enrolled speakers at startup (non-fatal): {e}"),
+        }
 
-        *engines_state.lock().unwrap() = Some(Arc::new(PipelineEngines { asr, diarization, llm, embedding }));
+        *engines_state.lock().unwrap() = Some(Arc::new(PipelineEngines { asr, diarization, llm, embedding, speaker_id }));
         println!("all pipeline engines loaded and ready");
     });
 }
@@ -211,6 +225,7 @@ fn download_missing_models(app: tauri::AppHandle, paths: State<AppPaths>, engine
     use tauri::Emitter;
 
     let models_dir = paths.data_dir.join("models");
+    let data_dir = paths.data_dir.clone();
     let engines_state = engines.0.clone();
     let missing: Vec<model_provisioning::ModelSpec> =
         model_provisioning::missing_models(&models_dir).into_iter().cloned().collect();
@@ -234,7 +249,7 @@ fn download_missing_models(app: tauri::AppHandle, paths: State<AppPaths>, engine
             }
         }
         let _ = app.emit("model-download-complete", ());
-        spawn_engine_loading(models_dir, engines_state);
+        spawn_engine_loading(models_dir, data_dir, engines_state);
     });
 }
 
@@ -259,6 +274,67 @@ fn undelete_meeting(meeting_id: i64, paths: State<AppPaths>) -> Result<(), Strin
     storage::undelete_meeting(&conn, meeting_id).map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+fn list_known_speakers(paths: State<AppPaths>) -> Result<Vec<String>, String> {
+    let db_path = paths.data_dir.join("kai-notetaker.sqlite3");
+    let conn = storage::open_connection(&db_path).map_err(|e| e.to_string())?;
+    Ok(storage::list_known_speakers(&conn).map_err(|e| e.to_string())?.into_iter().map(|(_, name)| name).collect())
+}
+
+/// Labels one diarized speaker within one meeting. `remember: true` also
+/// extracts a real voice sample from that speaker's actual audio and
+/// enrolls it — both in the database (so it survives a restart) and in
+/// the live `SpeakerIdEngine` (so it's recognized for the rest of this
+/// session immediately, no restart needed). `remember: false` just sets
+/// a one-off display label for this meeting, with no persistent identity
+/// attached — for a person you don't expect to see again.
+#[tauri::command]
+fn label_meeting_speaker(
+    meeting_id: i64,
+    speaker_index: i32,
+    name: String,
+    remember: bool,
+    paths: State<AppPaths>,
+    engines: State<EnginesState>,
+) -> Result<(), String> {
+    let db_path = paths.data_dir.join("kai-notetaker.sqlite3");
+    let conn = storage::open_connection(&db_path).map_err(|e| e.to_string())?;
+
+    if !remember {
+        storage::label_meeting_speaker(&conn, meeting_id, speaker_index, None, &name).map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+
+    let detail = storage::get_meeting_detail(&conn, meeting_id).map_err(|e| e.to_string())?;
+    let audio_path = detail.audio_path.ok_or("this meeting has no audio to extract a voice sample from")?;
+    let ranges: Vec<(i64, i64)> = detail
+        .transcript
+        .iter()
+        .filter(|s| s.speaker == Some(speaker_index))
+        .map(|s| (s.start_ms, s.end_ms))
+        .collect();
+    if ranges.is_empty() {
+        return Err(format!("no transcript segments found for speaker {speaker_index}"));
+    }
+
+    let engines_guard = engines.0.lock().map_err(|_| "engines lock poisoned".to_string())?;
+    let engines_ref = engines_guard.as_ref().ok_or("models are still loading — try again shortly")?;
+
+    let embedding = pipeline::extract_embedding_for_speaker_ranges(
+        std::path::Path::new(&audio_path),
+        &ranges,
+        &engines_ref.speaker_id,
+    )
+    .map_err(|e| e.to_string())?;
+
+    let known_speaker_id = storage::get_or_create_known_speaker(&conn, &name).map_err(|e| e.to_string())?;
+    storage::add_speaker_embedding_sample(&conn, known_speaker_id, &embedding, Some(meeting_id)).map_err(|e| e.to_string())?;
+    storage::label_meeting_speaker(&conn, meeting_id, speaker_index, Some(known_speaker_id), &name).map_err(|e| e.to_string())?;
+    engines_ref.speaker_id.enroll(&name, &embedding);
+
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -276,7 +352,9 @@ pub fn run() {
             download_missing_models,
             rename_meeting,
             delete_meeting,
-            undelete_meeting
+            undelete_meeting,
+            list_known_speakers,
+            label_meeting_speaker
         ])
         .setup(|app| {
             let data_dir = app
@@ -301,7 +379,7 @@ pub fn run() {
             // second model loads.
             let engines_state = app.state::<EnginesState>().0.clone();
             let models_dir = model_provisioning::resolve_models_dir(&data_dir);
-            spawn_engine_loading(models_dir, engines_state);
+            spawn_engine_loading(models_dir, data_dir.clone(), engines_state);
 
             tauri::async_runtime::spawn(async move {
                 // Sweep once shortly after launch, then on a fixed interval.
