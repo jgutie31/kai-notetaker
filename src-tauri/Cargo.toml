@@ -35,9 +35,12 @@ llama-cpp-2 = { version = "0.1.154", features = ["metal"] }
 encoding_rs = "0.8"
 reqwest = { version = "0.12", features = ["blocking", "json"] }
 rubato = "4.0"
-security-framework = "3.7.0"
 getrandom = "0.4.3"
-security-framework-sys = "2.17.0"
+# `v1` (default) covers macOS Keychain, Windows Credential Manager, and
+# Linux Secret Service behind one API — real cross-platform secret
+# storage, not macOS-only. Named explicitly even though it's the crate's
+# default feature set, so this stays self-documenting.
+keyring = { version = "4.1.6", features = ["v1"] }
 
 [dev-dependencies]
 tempfile = "3"
