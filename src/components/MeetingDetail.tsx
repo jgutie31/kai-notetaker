@@ -59,6 +59,7 @@ interface MeetingDetailProps {
 
 const MIN_TOP_HEIGHT = 140;
 const MIN_TRANSCRIPT_HEIGHT = 100;
+const DEFAULT_TOP_FRACTION = 0.55;
 
 export function MeetingDetail({ meetingId, onBack, onDelete }: MeetingDetailProps) {
   const [detail, setDetail] = useState<MeetingDetailData | null>(null);
@@ -73,6 +74,7 @@ export function MeetingDetail({ meetingId, onBack, onDelete }: MeetingDetailProp
   const segmentRefs = useRef<(HTMLDivElement | null)[]>([]);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const topRef = useRef<HTMLDivElement | null>(null);
+  const resizerRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -178,6 +180,40 @@ export function MeetingDetail({ meetingId, onBack, onDelete }: MeetingDetailProp
     window.addEventListener("pointerup", handlePointerUp);
   };
 
+  // Real bug fixed here: previously `topHeight === null` meant "let CSS
+  // decide naturally" (flex-shrink: 0, no cap) — at a small window size
+  // that let the top section's content (summary + action items) grow
+  // taller than the actual window, pushing/clipping content off-screen
+  // instead of scrolling, since flex-shrink:0 never gave the element a
+  // constrained height for its own overflow-y:auto to act on. Jeremiah
+  // only noticed Action Items existed after going fullscreen. Fix: always
+  // maintain a real, clamped pixel height — recalculated whenever the
+  // window/container is resized, not just set once at drag-time — so a
+  // smaller window properly scrolls the top section instead of hiding
+  // content, and a manually-dragged split stays valid instead of going
+  // stale if the window shrinks afterward.
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+
+    const recalculate = () => {
+      const containerHeight = container.getBoundingClientRect().height;
+      if (containerHeight === 0) return;
+      const resizerHeight = resizerRef.current?.getBoundingClientRect().height ?? 14;
+      const maxTop = Math.max(containerHeight - MIN_TRANSCRIPT_HEIGHT - resizerHeight, MIN_TOP_HEIGHT);
+
+      setTopHeight((prev) => {
+        const base = prev ?? containerHeight * DEFAULT_TOP_FRACTION;
+        return Math.min(Math.max(base, MIN_TOP_HEIGHT), maxTop);
+      });
+    };
+
+    recalculate();
+    const observer = new ResizeObserver(recalculate);
+    observer.observe(container);
+    return () => observer.disconnect();
+  }, [detail?.status]);
+
   return (
     <div ref={containerRef} className={`detail-screen ${isResizing ? "detail-screen--resizing" : ""}`}>
       <div
@@ -280,6 +316,7 @@ export function MeetingDetail({ meetingId, onBack, onDelete }: MeetingDetailProp
       {detail && detail.status === "ready" && (
         <>
           <div
+            ref={resizerRef}
             className="detail-screen__resizer"
             role="separator"
             aria-orientation="horizontal"
