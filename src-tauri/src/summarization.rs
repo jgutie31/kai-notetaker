@@ -49,7 +49,9 @@ fn chunk_summary_prompt(chunk: &str) -> String {
          or sounds like a sound check. Do NOT say the transcript is missing, unclear, \
          insufficient, or that you are unable to summarize it — there is always \
          something to report, even if it's simply that someone did a brief test \
-         recording.\n\n\
+         recording. Output ONLY the summary itself — no preamble like \"Here is a \
+         summary\" or \"Here's what was discussed\", no restating these instructions, \
+         no closing remarks.\n\n\
          Excerpt:\n{chunk}\
          <|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
     )
@@ -60,7 +62,10 @@ fn reduce_prompt(combined_chunk_summaries: &str) -> String {
         "<|start_header_id|>user<|end_header_id|>\n\n\
          The following are summaries of consecutive excerpts from one meeting. \
          Combine them into a single coherent meeting summary of 4-8 sentences. \
-         Do not repeat the same point twice; merge overlapping content.\n\n\
+         Do not repeat the same point twice; merge overlapping content. Output ONLY \
+         the summary itself — no preamble like \"Here is a combined meeting summary\" \
+         or \"Here is a summary of X sentences\", no restating these instructions, no \
+         closing remarks.\n\n\
          Excerpt summaries:\n{combined_chunk_summaries}\
          <|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
     )
@@ -204,6 +209,14 @@ mod tests {
         assert!(
             !lower.contains("no meeting transcript") && !lower.contains("unable to create"),
             "summary regressed into meta-commentary/refusal instead of a direct answer: {}",
+            result.meeting_summary
+        );
+        // Real bug Jeremiah reported: summaries opened with a preamble like
+        // "Here is a combined meeting summary of 6 sentences:" instead of
+        // just the summary itself.
+        assert!(
+            !lower.starts_with("here is") && !lower.starts_with("here's"),
+            "summary opened with a preamble instead of starting directly: {}",
             result.meeting_summary
         );
     }

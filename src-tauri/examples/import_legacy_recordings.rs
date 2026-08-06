@@ -50,6 +50,49 @@ fn main() {
         return;
     }
 
+    // Clean-summaries mode: strips a leading LLM preamble (e.g. "Here is a
+    // combined meeting summary of 6 sentences:") from already-stored
+    // summaries — real bug Jeremiah reported after the fact. The prompt
+    // fix (summarization.rs) only affects summaries generated from here
+    // on; this is the one-off cleanup for what's already in the database.
+    if args.get(1).map(String::as_str) == Some("clean-summaries") {
+        let conn = storage::open_connection(&db_path).expect("open real encrypted db");
+        let mut stmt = conn.prepare("SELECT meeting_id, summary_text FROM meeting_summaries").unwrap();
+        let rows: Vec<(i64, String)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        drop(stmt);
+
+        let mut cleaned = 0;
+        for (meeting_id, text) in rows {
+            let lower = text.to_lowercase();
+            if !lower.starts_with("here is") && !lower.starts_with("here's") {
+                continue;
+            }
+            // The preamble always ends with a colon before the real
+            // content — strip through the first "colon then newline"
+            // within a reasonable prefix window, then trim leading
+            // whitespace/newlines from what remains.
+            let search_window = &text[..text.len().min(120)];
+            if let Some(colon_pos) = search_window.find(':') {
+                let stripped = text[colon_pos + 1..].trim_start();
+                if !stripped.is_empty() {
+                    conn.execute(
+                        "UPDATE meeting_summaries SET summary_text = ?1 WHERE meeting_id = ?2",
+                        rusqlite::params![stripped, meeting_id],
+                    )
+                    .unwrap();
+                    println!("cleaned meeting_id={meeting_id}: {:?} -> {:?}", &text[..colon_pos.min(text.len())], &stripped[..stripped.len().min(60)]);
+                    cleaned += 1;
+                }
+            }
+        }
+        println!("cleaned {cleaned} summaries");
+        return;
+    }
+
     // Reprocess mode: `cargo run --example import_legacy_recordings -- reprocess <meeting_id>`
     // Re-runs the full pipeline (ASR/diarization/summarization) against
     // the SAME already-imported audio file, using whatever fixes have
