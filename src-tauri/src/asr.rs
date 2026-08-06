@@ -74,6 +74,32 @@ impl AsrEngine {
         // Auto-detect + transcribe-in-original-language, per Jeremiah's
         // explicit choice (2026-08-05) over always-translate-to-English.
         params.set_language(Some("auto"));
+        // `no_context: true` — each ~30s window is transcribed fresh
+        // rather than conditioned on the previous window's text. Kept as
+        // real, defensible hygiene against cross-window context bias, but
+        // confirmed (via a real reprocessing run against a 43-minute
+        // meeting) NOT to be the actual fix for the failure below — the
+        // real transcript came back byte-for-byte identical with this set.
+        params.set_no_context(true);
+        // Real bug root-caused by reading whisper.cpp's own decode loop
+        // directly (not assumed): 1481 of 1579 segments (94%) of that same
+        // 43-minute meeting were the exact same hallucinated sentence.
+        // whisper.cpp's temperature-fallback ladder targets WITHIN-window
+        // repetition (via `entropy_thold` on one window's own token
+        // diversity) — it does nothing for a single fluent, non-degenerate
+        // sentence recurring ACROSS dozens of separate windows, which is
+        // what a long stretch of similar background noise/silence actually
+        // produces (a real "(wind howling)" segment elsewhere in the same
+        // file confirms genuine non-speech audio is present). The
+        // mechanism that DOES target this is the `is_no_speech` gate,
+        // which suppresses a window's text entirely when the model's own
+        // `no_speech_prob` is high AND `avg_logprobs` is low — but the
+        // crate's default `logprob_thold` (-1.0) is so permissive that a
+        // fluent-sounding hallucination on non-speech audio never trips
+        // it, since it "sounds confident" even though it's wrong. Raising
+        // it (less negative) makes that AND-gate fire on exactly this
+        // pattern without touching genuinely confident real speech.
+        params.set_logprob_thold(-0.5);
         state
             .full(params, samples)
             .map_err(|e| AsrError::Transcribe(e.to_string()))?;

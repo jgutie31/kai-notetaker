@@ -238,6 +238,27 @@ fn download_missing_models(app: tauri::AppHandle, paths: State<AppPaths>, engine
     });
 }
 
+#[tauri::command]
+fn rename_meeting(meeting_id: i64, title: String, paths: State<AppPaths>) -> Result<(), String> {
+    let db_path = paths.data_dir.join("kai-notetaker.sqlite3");
+    let conn = storage::open_connection(&db_path).map_err(|e| e.to_string())?;
+    storage::rename_meeting(&conn, meeting_id, &title).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn delete_meeting(meeting_id: i64, paths: State<AppPaths>) -> Result<(), String> {
+    let db_path = paths.data_dir.join("kai-notetaker.sqlite3");
+    let conn = storage::open_connection(&db_path).map_err(|e| e.to_string())?;
+    storage::delete_meeting(&conn, meeting_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn undelete_meeting(meeting_id: i64, paths: State<AppPaths>) -> Result<(), String> {
+    let db_path = paths.data_dir.join("kai-notetaker.sqlite3");
+    let conn = storage::open_connection(&db_path).map_err(|e| e.to_string())?;
+    storage::undelete_meeting(&conn, meeting_id).map_err(|e| e.to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -252,7 +273,10 @@ pub fn run() {
             list_meetings,
             get_meeting_detail,
             check_missing_models,
-            download_missing_models
+            download_missing_models,
+            rename_meeting,
+            delete_meeting,
+            undelete_meeting
         ])
         .setup(|app| {
             let data_dir = app

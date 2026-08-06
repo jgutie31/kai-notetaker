@@ -31,9 +31,12 @@ function formatDate(isoLike: string): string {
 
 interface MeetingLibraryProps {
   onSelectMeeting: (id: number) => void;
+  onDelete: (meetingId: number, title: string) => void;
+  /** Bumping this forces a re-fetch — used after an undo restores a meeting. */
+  refreshToken: number;
 }
 
-export function MeetingLibrary({ onSelectMeeting }: MeetingLibraryProps) {
+export function MeetingLibrary({ onSelectMeeting, onDelete, refreshToken }: MeetingLibraryProps) {
   const [meetings, setMeetings] = useState<MeetingListItem[]>([]);
   const [error, setError] = useState<string | null>(null);
 
@@ -51,6 +54,20 @@ export function MeetingLibrary({ onSelectMeeting }: MeetingLibraryProps) {
     const interval = setInterval(refresh, 4000);
     return () => clearInterval(interval);
   }, []);
+
+  useEffect(() => {
+    refresh();
+  }, [refreshToken]);
+
+  const handleDelete = (e: React.MouseEvent, m: MeetingListItem) => {
+    e.stopPropagation();
+    invoke("delete_meeting", { meetingId: m.id })
+      .then(() => {
+        setMeetings((prev) => prev.filter((x) => x.id !== m.id));
+        onDelete(m.id, m.title ?? "Untitled meeting");
+      })
+      .catch((err) => setError(String(err)));
+  };
 
   return (
     <div className="library-screen">
@@ -72,6 +89,14 @@ export function MeetingLibrary({ onSelectMeeting }: MeetingLibraryProps) {
               </span>
             </div>
             <span className={`library-row__status library-row__status--${m.status}`}>{m.status}</span>
+            <button
+              type="button"
+              className="library-row__delete"
+              aria-label="Delete meeting"
+              onClick={(e) => handleDelete(e, m)}
+            >
+              ×
+            </button>
           </div>
         ))}
       </div>

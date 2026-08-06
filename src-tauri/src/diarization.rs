@@ -16,7 +16,7 @@
 
 use serde::{Deserialize, Serialize};
 use sherpa_onnx::{
-    OfflineSpeakerDiarization, OfflineSpeakerDiarizationConfig,
+    FastClusteringConfig, OfflineSpeakerDiarization, OfflineSpeakerDiarizationConfig,
     OfflineSpeakerSegmentationModelConfig, OfflineSpeakerSegmentationPyannoteModelConfig,
     SpeakerEmbeddingExtractorConfig,
 };
@@ -70,6 +70,18 @@ impl DiarizationEngine {
                 debug: false,
                 provider: Some("cpu".to_string()),
             },
+            // Real bug fixed here: the crate's own `FastClusteringConfig`
+            // default is threshold=0.5, which is far too permissive for
+            // real speech — confirmed against a genuine 43-minute,
+            // 3-person meeting recording that produced speaker labels up
+            // to "Speaker 31" (rampant over-segmentation, not a display
+            // bug). sherpa-onnx's own official example for exactly this
+            // scenario (`num_clusters` unknown) uses
+            // `--clustering.cluster-threshold=0.90` against a real
+            // multi-speaker test file — "a larger threshold leads to
+            // fewer clusters." 0.5 was never a reasonable production
+            // value for real audio; it's just the bare struct default.
+            clustering: FastClusteringConfig { num_clusters: -1, threshold: 0.9 },
             ..Default::default()
         };
 

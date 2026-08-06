@@ -54,17 +54,20 @@ function findActiveSegmentIndex(transcript: TranscriptSegmentRow[], currentTimeM
 interface MeetingDetailProps {
   meetingId: number;
   onBack: () => void;
+  onDelete: (meetingId: number, title: string) => void;
 }
 
 const MIN_TOP_HEIGHT = 140;
 const MIN_TRANSCRIPT_HEIGHT = 100;
 
-export function MeetingDetail({ meetingId, onBack }: MeetingDetailProps) {
+export function MeetingDetail({ meetingId, onBack, onDelete }: MeetingDetailProps) {
   const [detail, setDetail] = useState<MeetingDetailData | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [currentTimeMs, setCurrentTimeMs] = useState(0);
   const [topHeight, setTopHeight] = useState<number | null>(null);
   const [isResizing, setIsResizing] = useState(false);
+  const [isEditingTitle, setIsEditingTitle] = useState(false);
+  const [titleDraft, setTitleDraft] = useState("");
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const segmentRefs = useRef<(HTMLDivElement | null)[]>([]);
@@ -114,6 +117,32 @@ export function MeetingDetail({ meetingId, onBack }: MeetingDetailProps) {
     audioRef.current.currentTime = startMs / 1000;
   };
 
+  const startEditingTitle = () => {
+    if (!detail || detail.status !== "ready") return;
+    setTitleDraft(detail.title ?? "");
+    setIsEditingTitle(true);
+  };
+
+  const commitTitleEdit = () => {
+    if (!detail) return;
+    setIsEditingTitle(false);
+    const trimmed = titleDraft.trim();
+    if (!trimmed || trimmed === detail.title) return;
+    invoke("rename_meeting", { meetingId: detail.id, title: trimmed })
+      .then(() => setDetail((prev) => (prev ? { ...prev, title: trimmed } : prev)))
+      .catch((e) => setError(String(e)));
+  };
+
+  const handleDeleteClick = () => {
+    if (!detail) return;
+    invoke("delete_meeting", { meetingId: detail.id })
+      .then(() => {
+        onDelete(detail.id, detail.title ?? "Untitled meeting");
+        onBack();
+      })
+      .catch((e) => setError(String(e)));
+  };
+
   // Free-drag resize between the fixed top section and the transcript pane.
   // Reads real layout numbers at drag-start (rather than assuming a fixed
   // window size) so it clamps correctly regardless of window resize.
@@ -156,15 +185,43 @@ export function MeetingDetail({ meetingId, onBack }: MeetingDetailProps) {
         className="detail-screen__top"
         style={topHeight !== null ? { height: topHeight, flex: "none" } : undefined}
       >
-        <button type="button" className="detail-screen__back" onClick={onBack}>
-          ← Back to meetings
-        </button>
+        <div className="detail-screen__toolbar">
+          <button type="button" className="detail-screen__back" onClick={onBack}>
+            ← Back to meetings
+          </button>
+          {detail && (
+            <button type="button" className="detail-screen__delete" onClick={handleDeleteClick}>
+              Delete
+            </button>
+          )}
+        </div>
 
         {error && <div className="recording-screen__error">{error}</div>}
 
         {detail && (
           <>
-            <h1 className="detail-screen__title">{detail.title ?? "Processing…"}</h1>
+            {isEditingTitle ? (
+              <input
+                type="text"
+                autoFocus
+                className="detail-screen__title-input"
+                value={titleDraft}
+                onChange={(e) => setTitleDraft(e.target.value)}
+                onBlur={commitTitleEdit}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") commitTitleEdit();
+                  if (e.key === "Escape") setIsEditingTitle(false);
+                }}
+              />
+            ) : (
+              <h1
+                className={`detail-screen__title ${detail.status === "ready" ? "detail-screen__title--editable" : ""}`}
+                onClick={startEditingTitle}
+                title={detail.status === "ready" ? "Click to rename" : undefined}
+              >
+                {detail.title ?? "Processing…"}
+              </h1>
+            )}
             <div className="detail-screen__meta">
               {Math.floor(detail.duration_secs / 60)}:{(detail.duration_secs % 60).toString().padStart(2, "0")}
             </div>

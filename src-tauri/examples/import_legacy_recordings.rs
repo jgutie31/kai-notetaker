@@ -26,6 +26,73 @@ fn main() {
     let db_path = app_data_dir.join("kai-notetaker.sqlite3");
     let audit_path = app_data_dir.join("audit-log.jsonl");
 
+    // Diagnostic mode: `cargo run --example import_legacy_recordings -- inspect <meeting_id>`
+    // Reuses this already-Keychain-approved binary identity rather than a
+    // new example (a new binary path triggers a fresh macOS authorization
+    // prompt — confirmed the hard way earlier this session).
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("inspect") {
+        let meeting_id: i64 = args.get(2).expect("usage: inspect <meeting_id>").parse().expect("meeting_id must be an integer");
+        let conn = storage::open_connection(&db_path).expect("open real encrypted db");
+        let detail = storage::get_meeting_detail(&conn, meeting_id).expect("get meeting detail");
+        println!("id={} title={:?} status={} duration={}s", detail.id, detail.title, detail.status, detail.duration_secs);
+        println!("summary: {:?}", detail.summary);
+        println!("action_items: {} total", detail.action_items.len());
+        for item in &detail.action_items {
+            println!("  - {:?} (owner={:?}, due={:?})", item.description, item.owner, item.due_date);
+        }
+        let distinct_speakers: std::collections::BTreeSet<Option<i32>> =
+            detail.transcript.iter().map(|s| s.speaker).collect();
+        println!("transcript: {} segments, distinct speaker labels: {:?}", detail.transcript.len(), distinct_speakers);
+        for seg in &detail.transcript {
+            println!("  [{}ms-{}ms] speaker={:?}: {}", seg.start_ms, seg.end_ms, seg.speaker, seg.text);
+        }
+        return;
+    }
+
+    // Reprocess mode: `cargo run --example import_legacy_recordings -- reprocess <meeting_id>`
+    // Re-runs the full pipeline (ASR/diarization/summarization) against
+    // the SAME already-imported audio file, using whatever fixes have
+    // landed in the pipeline code since the original import — e.g. the
+    // diarization clustering threshold fix and the ASR no_context fix.
+    // Clears the meeting's existing transcript/summary/action-items/
+    // embeddings first so the new run doesn't append alongside stale data.
+    if args.get(1).map(String::as_str) == Some("reprocess") {
+        let meeting_id: i64 = args.get(2).expect("usage: reprocess <meeting_id>").parse().expect("meeting_id must be an integer");
+        let conn = storage::open_connection(&db_path).expect("open real encrypted db");
+        let existing = storage::get_meeting_detail(&conn, meeting_id).expect("get meeting detail");
+        let audio_path = existing.audio_path.expect("meeting has no audio_path to reprocess");
+
+        conn.execute("DELETE FROM transcript_segments WHERE meeting_id = ?1", [meeting_id]).unwrap();
+        conn.execute("DELETE FROM meeting_summaries WHERE meeting_id = ?1", [meeting_id]).unwrap();
+        conn.execute("DELETE FROM action_items WHERE meeting_id = ?1", [meeting_id]).unwrap();
+        conn.execute("DELETE FROM meeting_embeddings WHERE meeting_id = ?1", [meeting_id]).unwrap();
+        conn.execute("UPDATE meetings SET status = 'processing', title = NULL WHERE id = ?1", [meeting_id]).unwrap();
+
+        println!("loading engines (this takes a while — 4 real models)...");
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let engines = PipelineEngines {
+            asr: AsrEngine::load(&manifest_dir.join("models/ggml-base.bin"), true).expect("load ASR"),
+            diarization: DiarizationEngine::load(
+                &manifest_dir.join("models/diarization/sherpa-onnx-pyannote-segmentation-3-0/model.onnx"),
+                &manifest_dir.join("models/diarization/speaker-embedding.onnx"),
+            )
+            .expect("load diarization"),
+            llm: LlmEngine::load(&manifest_dir.join("models/llm/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"), 1000)
+                .expect("load LLM"),
+            embedding: EmbeddingEngine::load(&manifest_dir.join("models/embeddings/bge-small-en-v1.5-f16.gguf"))
+                .expect("load embeddings"),
+        };
+        println!("engines loaded. reprocessing meeting_id={meeting_id} ({audio_path})...");
+
+        let audit = AuditLog::new(&audit_path);
+        match pipeline::process_meeting(&conn, &audit, &engines, meeting_id, std::path::Path::new(&audio_path)) {
+            Ok(()) => println!("OK: reprocessed meeting_id={meeting_id}"),
+            Err(e) => eprintln!("FAILED reprocessing meeting_id={meeting_id}: {e}"),
+        }
+        return;
+    }
+
     std::fs::create_dir_all(&new_recordings_dir).expect("create recordings dir");
 
     println!("loading engines (this takes a while — 4 real models)...");

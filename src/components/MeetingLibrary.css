@@ -2,6 +2,7 @@
   height: 100%;
   overflow-y: auto;
   padding: var(--space-6) var(--space-8);
+  position: relative;
 }
 
 .library-screen__title {
@@ -87,6 +88,33 @@
 }
 
 .library-row__status--failed {
+  background: var(--color-danger-surface);
+  color: var(--color-danger);
+}
+
+.library-row__delete {
+  flex-shrink: 0;
+  width: 22px;
+  height: 22px;
+  border-radius: var(--radius-full);
+  border: none;
+  background: transparent;
+  color: var(--color-text-secondary);
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0;
+  transition:
+    opacity var(--duration-fast) var(--ease-standard),
+    background var(--duration-fast) var(--ease-standard),
+    color var(--duration-fast) var(--ease-standard);
+}
+
+.library-row:hover .library-row__delete {
+  opacity: 1;
+}
+
+.library-row__delete:hover {
   background: var(--color-danger-surface);
   color: var(--color-danger);
 }

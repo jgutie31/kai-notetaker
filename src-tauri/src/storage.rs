@@ -188,6 +188,22 @@ pub fn ensure_schema(conn: &Connection) -> Result<(), StorageError> {
             FOREIGN KEY(meeting_id) REFERENCES meetings(id)
          );",
     )?;
+    apply_column_migrations(conn)?;
+    Ok(())
+}
+
+/// Real, non-destructive migrations — additive `ALTER TABLE ... ADD
+/// COLUMN` only, never a drop/recreate. Now that real meeting data
+/// exists (including real KCG client recordings), `reset_if_schema_outdated`'s
+/// drop-everything approach is no longer an acceptable way to evolve the
+/// schema; this is the actual migration path going forward. Each
+/// migration checks for its own column first so re-running is always
+/// safe (idempotent).
+fn apply_column_migrations(conn: &Connection) -> Result<(), StorageError> {
+    let has_deleted_at = conn.prepare("SELECT deleted_at FROM meetings LIMIT 1").is_ok();
+    if !has_deleted_at {
+        conn.execute_batch("ALTER TABLE meetings ADD COLUMN deleted_at TEXT;")?;
+    }
     Ok(())
 }
 
@@ -271,9 +287,43 @@ pub fn insert_embedding(conn: &Connection, meeting_id: i64, chunk_text: &str, ve
     Ok(())
 }
 
+pub fn rename_meeting(conn: &Connection, meeting_id: i64, title: &str) -> Result<(), StorageError> {
+    let rows_affected = conn.execute(
+        "UPDATE meetings SET title = ?1 WHERE id = ?2 AND deleted_at IS NULL",
+        rusqlite::params![title, meeting_id],
+    )?;
+    if rows_affected == 0 {
+        return Err(StorageError::MeetingNotFound(meeting_id));
+    }
+    Ok(())
+}
+
+/// Soft delete — hides the meeting from `list_meetings` immediately but
+/// keeps its rows and audio file on disk, so `undelete_meeting` can
+/// reverse an accidental delete. Real hard purging (if it ever happens)
+/// is RetentionGate's job, not this command's.
+pub fn delete_meeting(conn: &Connection, meeting_id: i64) -> Result<(), StorageError> {
+    let rows_affected = conn.execute(
+        "UPDATE meetings SET deleted_at = datetime('now') WHERE id = ?1 AND deleted_at IS NULL",
+        [meeting_id],
+    )?;
+    if rows_affected == 0 {
+        return Err(StorageError::MeetingNotFound(meeting_id));
+    }
+    Ok(())
+}
+
+pub fn undelete_meeting(conn: &Connection, meeting_id: i64) -> Result<(), StorageError> {
+    let rows_affected = conn.execute("UPDATE meetings SET deleted_at = NULL WHERE id = ?1", [meeting_id])?;
+    if rows_affected == 0 {
+        return Err(StorageError::MeetingNotFound(meeting_id));
+    }
+    Ok(())
+}
+
 pub fn list_meetings(conn: &Connection) -> Result<Vec<MeetingListItem>, StorageError> {
     let mut stmt = conn.prepare(
-        "SELECT id, created_at, title, duration_secs, status FROM meetings ORDER BY created_at DESC",
+        "SELECT id, created_at, title, duration_secs, status FROM meetings WHERE deleted_at IS NULL ORDER BY created_at DESC",
     )?;
     let rows = stmt.query_map([], |row| {
         Ok(MeetingListItem {
@@ -551,5 +601,76 @@ mod tests {
             .filter_map(|e| e.ok())
             .any(|e| e.file_name().to_string_lossy().starts_with(&format!("{stem}.pre-encryption-backup-")));
         assert!(archived, "expected the original plaintext file to be archived alongside the new one");
+    }
+
+    #[test]
+    fn rename_meeting_updates_title() {
+        let conn = test_db();
+        let id = create_meeting(&conn, "a.wav", 10).unwrap();
+        mark_meeting_ready(&conn, id, "Original Title").unwrap();
+
+        rename_meeting(&conn, id, "Strategy Call with Nesta").unwrap();
+
+        let detail = get_meeting_detail(&conn, id).unwrap();
+        assert_eq!(detail.title.as_deref(), Some("Strategy Call with Nesta"));
+    }
+
+    #[test]
+    fn rename_meeting_errors_for_unknown_id() {
+        let conn = test_db();
+        let result = rename_meeting(&conn, 9999, "New Title");
+        assert!(matches!(result, Err(StorageError::MeetingNotFound(9999))));
+    }
+
+    #[test]
+    fn deleted_meeting_disappears_from_list_but_undelete_restores_it() {
+        let conn = test_db();
+        let id = create_meeting(&conn, "a.wav", 10).unwrap();
+        mark_meeting_ready(&conn, id, "Real Meeting").unwrap();
+        assert_eq!(list_meetings(&conn).unwrap().len(), 1);
+
+        delete_meeting(&conn, id).unwrap();
+        assert!(list_meetings(&conn).unwrap().is_empty(), "deleted meeting should not appear in the list");
+
+        // Deleted rows aren't gone — this is what makes undo possible.
+        let detail = get_meeting_detail(&conn, id).unwrap();
+        assert_eq!(detail.title.as_deref(), Some("Real Meeting"));
+
+        undelete_meeting(&conn, id).unwrap();
+        assert_eq!(list_meetings(&conn).unwrap().len(), 1, "undelete should restore it to the list");
+    }
+
+    #[test]
+    fn delete_meeting_errors_for_unknown_id() {
+        let conn = test_db();
+        let result = delete_meeting(&conn, 9999);
+        assert!(matches!(result, Err(StorageError::MeetingNotFound(9999))));
+    }
+
+    #[test]
+    fn deleted_at_column_migration_is_idempotent_on_a_pre_existing_database() {
+        // Simulate a real pre-migration database (schema created before
+        // this column existed) — ensure_schema must add the column
+        // without erroring, and running it again must not error either.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE meetings (
+                id INTEGER PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                title TEXT,
+                duration_secs INTEGER NOT NULL DEFAULT 0,
+                audio_path TEXT,
+                status TEXT NOT NULL DEFAULT 'processing',
+                error_message TEXT
+             );",
+        )
+        .unwrap();
+
+        ensure_schema(&conn).unwrap();
+        ensure_schema(&conn).unwrap();
+
+        let id = create_meeting(&conn, "a.wav", 5).unwrap();
+        delete_meeting(&conn, id).unwrap();
+        assert!(list_meetings(&conn).unwrap().is_empty());
     }
 }
