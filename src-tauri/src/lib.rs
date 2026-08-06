@@ -1,15 +1,20 @@
-mod asr;
+// `pub` on the modules an examples/ binary needs (MeetingImport: storage,
+// pipeline, audit_log, and the four engine modules) — examples compile
+// against this crate as an external dependency, so they only see items
+// re-exported at this level.
+pub mod asr;
 mod audio_capture;
-mod audit_log;
+pub mod audit_log;
 mod cloud_sync_gate;
-mod diarization;
-mod embeddings;
+pub mod diarization;
+pub mod embeddings;
 mod frontier;
 mod keychain;
-mod llm;
-mod pipeline;
+pub mod llm;
+mod model_provisioning;
+pub mod pipeline;
 mod retention;
-mod storage;
+pub mod storage;
 mod summarization;
 
 use audit_log::AuditLog;
@@ -36,6 +41,55 @@ struct EnginesState(Arc<Mutex<Option<Arc<PipelineEngines>>>>);
 
 struct AppPaths {
     data_dir: PathBuf,
+}
+
+/// Loads the four heavy models from `models_dir` in a background OS
+/// thread and populates `engines_state` on success. Shared by app startup
+/// (models already present) and by `download_missing_models` (models
+/// just finished downloading) — both cases converge on the same
+/// "models are on disk now, go load them" moment.
+fn spawn_engine_loading(models_dir: PathBuf, engines_state: Arc<Mutex<Option<Arc<PipelineEngines>>>>) {
+    std::thread::spawn(move || {
+        if !model_provisioning::missing_models(&models_dir).is_empty() {
+            println!("models not yet provisioned — waiting for first-run download to complete");
+            return;
+        }
+
+        let asr = match asr::AsrEngine::load(&models_dir.join("ggml-base.bin"), true) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("failed to load ASR engine: {e}");
+                return;
+            }
+        };
+        let diarization = match diarization::DiarizationEngine::load(
+            &models_dir.join("diarization/sherpa-onnx-pyannote-segmentation-3-0/model.onnx"),
+            &models_dir.join("diarization/speaker-embedding.onnx"),
+        ) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("failed to load diarization engine: {e}");
+                return;
+            }
+        };
+        let llm = match llm::LlmEngine::load(&models_dir.join("llm/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"), 1000) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("failed to load LLM engine: {e}");
+                return;
+            }
+        };
+        let embedding = match embeddings::EmbeddingEngine::load(&models_dir.join("embeddings/bge-small-en-v1.5-f16.gguf")) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("failed to load embedding engine: {e}");
+                return;
+            }
+        };
+
+        *engines_state.lock().unwrap() = Some(Arc::new(PipelineEngines { asr, diarization, llm, embedding }));
+        println!("all pipeline engines loaded and ready");
+    });
 }
 
 #[tauri::command]
@@ -138,6 +192,52 @@ fn get_meeting_detail(meeting_id: i64, paths: State<AppPaths>) -> Result<storage
     storage::get_meeting_detail(&conn, meeting_id).map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+fn check_missing_models(paths: State<AppPaths>) -> Vec<String> {
+    let models_dir = model_provisioning::resolve_models_dir(&paths.data_dir);
+    model_provisioning::missing_models(&models_dir)
+        .into_iter()
+        .map(|spec| spec.name.to_string())
+        .collect()
+}
+
+/// Downloads every missing model in a background thread, emitting
+/// `model-download-progress` events the frontend listens for. Returns
+/// immediately — the actual download can take minutes (the LLM alone is
+/// ~4.6GB) and must not block the command/UI thread. Real downloads
+/// always target `$APPDATA/models`, not the dev-fallback source tree.
+#[tauri::command]
+fn download_missing_models(app: tauri::AppHandle, paths: State<AppPaths>, engines: State<EnginesState>) {
+    use tauri::Emitter;
+
+    let models_dir = paths.data_dir.join("models");
+    let engines_state = engines.0.clone();
+    let missing: Vec<model_provisioning::ModelSpec> =
+        model_provisioning::missing_models(&models_dir).into_iter().cloned().collect();
+
+    std::thread::spawn(move || {
+        for spec in &missing {
+            let app_for_progress = app.clone();
+            let model_name = spec.name.to_string();
+            let result = model_provisioning::download_model(spec, &models_dir, |downloaded, total| {
+                let _ = app_for_progress.emit(
+                    "model-download-progress",
+                    serde_json::json!({ "model": model_name, "downloaded": downloaded, "total": total }),
+                );
+            });
+            if let Err(e) = result {
+                let _ = app.emit(
+                    "model-download-error",
+                    serde_json::json!({ "model": spec.name, "error": e.to_string() }),
+                );
+                return;
+            }
+        }
+        let _ = app.emit("model-download-complete", ());
+        spawn_engine_loading(models_dir, engines_state);
+    });
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -150,7 +250,9 @@ pub fn run() {
             switch_recording_device,
             stop_recording,
             list_meetings,
-            get_meeting_detail
+            get_meeting_detail,
+            check_missing_models,
+            download_missing_models
         ])
         .setup(|app| {
             let data_dir = app
@@ -174,43 +276,8 @@ pub fn run() {
             // window appears immediately rather than stalling on multi-
             // second model loads.
             let engines_state = app.state::<EnginesState>().0.clone();
-            let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-            std::thread::spawn(move || {
-                let asr = match asr::AsrEngine::load(&manifest_dir.join("models/ggml-base.bin"), true) {
-                    Ok(e) => e,
-                    Err(e) => {
-                        eprintln!("failed to load ASR engine: {e}");
-                        return;
-                    }
-                };
-                let diarization = match diarization::DiarizationEngine::load(
-                    &manifest_dir.join("models/diarization/sherpa-onnx-pyannote-segmentation-3-0/model.onnx"),
-                    &manifest_dir.join("models/diarization/speaker-embedding.onnx"),
-                ) {
-                    Ok(e) => e,
-                    Err(e) => {
-                        eprintln!("failed to load diarization engine: {e}");
-                        return;
-                    }
-                };
-                let llm = match llm::LlmEngine::load(&manifest_dir.join("models/llm/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"), 1000) {
-                    Ok(e) => e,
-                    Err(e) => {
-                        eprintln!("failed to load LLM engine: {e}");
-                        return;
-                    }
-                };
-                let embedding = match embeddings::EmbeddingEngine::load(&manifest_dir.join("models/embeddings/bge-small-en-v1.5-f16.gguf")) {
-                    Ok(e) => e,
-                    Err(e) => {
-                        eprintln!("failed to load embedding engine: {e}");
-                        return;
-                    }
-                };
-
-                *engines_state.lock().unwrap() = Some(Arc::new(PipelineEngines { asr, diarization, llm, embedding }));
-                println!("all pipeline engines loaded and ready");
-            });
+            let models_dir = model_provisioning::resolve_models_dir(&data_dir);
+            spawn_engine_loading(models_dir, engines_state);
 
             tauri::async_runtime::spawn(async move {
                 // Sweep once shortly after launch, then on a fixed interval.

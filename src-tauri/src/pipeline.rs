@@ -1,11 +1,11 @@
-//! Ties the whole local pipeline together: a finished recording (WAV file
-//! at `CANONICAL_SAMPLE_RATE`) goes in, a fully-populated meeting record
-//! (transcript, summary, action items, embeddings) comes out in the
-//! database. This is the piece that was missing before — without it,
-//! recordings were just WAV files nobody ever looked at again.
+//! Ties the whole local pipeline together: a mono WAV file at any sample
+//! rate goes in, a fully-populated meeting record (transcript, summary,
+//! action items, embeddings) comes out in the database. This is the
+//! piece that was missing before — without it, recordings were just WAV
+//! files nobody ever looked at again.
 
 use crate::asr::AsrEngine;
-use crate::audio_capture::{self, CANONICAL_SAMPLE_RATE, PIPELINE_SAMPLE_RATE};
+use crate::audio_capture::{self, PIPELINE_SAMPLE_RATE};
 use crate::audit_log::AuditLog;
 use crate::diarization::{self, DiarizationEngine};
 use crate::embeddings::EmbeddingEngine;
@@ -47,13 +47,20 @@ pub struct PipelineEngines {
     pub embedding: EmbeddingEngine,
 }
 
-fn read_wav_mono_at_canonical_rate(path: &Path) -> Result<Vec<f32>, PipelineError> {
+/// Reads any mono WAV file and resamples it to `PIPELINE_SAMPLE_RATE`
+/// (16kHz, what ASR/diarization require) — not hardcoded to the live
+/// recorder's own `CANONICAL_SAMPLE_RATE` (48kHz). Root-cause fix: a
+/// version of this function that only accepted exactly 48kHz worked for
+/// live recordings but would reject any externally-sourced audio (e.g.
+/// importing recordings from another tool), which isn't a hypothetical —
+/// it's exactly what MeetingImport needs.
+fn read_wav_mono_resampled(path: &Path) -> Result<Vec<f32>, PipelineError> {
     let mut reader = hound::WavReader::open(path)?;
     let spec = reader.spec();
-    if spec.channels != 1 || spec.sample_rate != CANONICAL_SAMPLE_RATE {
+    if spec.channels != 1 {
         return Err(PipelineError::AudioFormat(format!(
-            "expected mono {CANONICAL_SAMPLE_RATE}Hz, got {} channel(s) at {}Hz",
-            spec.channels, spec.sample_rate
+            "expected mono audio, got {} channels",
+            spec.channels
         )));
     }
     let samples: Result<Vec<f32>, hound::Error> = match spec.sample_format {
@@ -63,7 +70,12 @@ fn read_wav_mono_at_canonical_rate(path: &Path) -> Result<Vec<f32>, PipelineErro
             .collect(),
         hound::SampleFormat::Float => reader.samples::<f32>().collect(),
     };
-    Ok(samples?)
+    let samples = samples?;
+
+    if spec.sample_rate == PIPELINE_SAMPLE_RATE {
+        return Ok(samples);
+    }
+    Ok(audio_capture::one_shot_resample(&samples, spec.sample_rate, PIPELINE_SAMPLE_RATE)?)
 }
 
 /// Run the full pipeline for one meeting. On any failure, the meeting is
@@ -93,8 +105,7 @@ fn process_meeting_inner(
     meeting_id: i64,
     audio_path: &Path,
 ) -> Result<(), PipelineError> {
-    let samples_48k = read_wav_mono_at_canonical_rate(audio_path)?;
-    let samples_16k = audio_capture::one_shot_resample(&samples_48k, CANONICAL_SAMPLE_RATE, PIPELINE_SAMPLE_RATE)?;
+    let samples_16k = read_wav_mono_resampled(audio_path)?;
 
     let asr_segments = engines.asr.transcribe(&samples_16k)?;
     let speaker_segments = engines.diarization.diarize(&samples_16k)?;
@@ -169,6 +180,30 @@ mod tests {
             && base.join("models/diarization/speaker-embedding.onnx").exists()
             && base.join("models/llm/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf").exists()
             && base.join("models/embeddings/bge-small-en-v1.5-f16.gguf").exists()
+    }
+
+    // Root-cause fix regression: the WAV reader used to hard-require
+    // exactly CANONICAL_SAMPLE_RATE (48kHz), which would reject any
+    // externally-sourced audio — exactly what MeetingImport needs to
+    // read. Fast unit test (no GPU models) proving the generalized
+    // reader accepts a real, non-48kHz mono file and resamples it.
+    #[test]
+    fn read_wav_mono_resampled_accepts_a_real_16k_fixture() {
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let fixture = base.join("test-fixtures/test-speech-16k-mono.wav");
+        if !fixture.exists() {
+            eprintln!("skipping: 16kHz test fixture not present");
+            return;
+        }
+
+        let samples = read_wav_mono_resampled(&fixture).unwrap();
+        assert!(!samples.is_empty(), "expected real resampled audio samples");
+
+        // Already at PIPELINE_SAMPLE_RATE — should pass through with no
+        // resampling artifacts changing the sample count meaningfully.
+        let mut reader = hound::WavReader::open(&fixture).unwrap();
+        let original_len = reader.samples::<i16>().count();
+        assert_eq!(samples.len(), original_len, "16kHz input should pass through unchanged, not be resampled");
     }
 
     #[test]

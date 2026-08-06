@@ -2,6 +2,7 @@ import { useState } from "react";
 import { RecordingControl } from "./components/RecordingControl";
 import { MeetingLibrary } from "./components/MeetingLibrary";
 import { MeetingDetail } from "./components/MeetingDetail";
+import { FirstRunSetup } from "./components/FirstRunSetup";
 import "./styles/tokens.css";
 import "./App.css";
 
@@ -10,6 +11,17 @@ type View = "recording" | "library";
 function App() {
   const [view, setView] = useState<View>("recording");
   const [selectedMeetingId, setSelectedMeetingId] = useState<number | null>(null);
+  const [modelsReady, setModelsReady] = useState(false);
+
+  if (!modelsReady) {
+    return (
+      <main className="app-shell">
+        <div className="app-content">
+          <FirstRunSetup onReady={() => setModelsReady(true)} />
+        </div>
+      </main>
+    );
+  }
 
   if (selectedMeetingId !== null) {
     return (
