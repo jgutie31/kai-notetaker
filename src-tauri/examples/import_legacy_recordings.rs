@@ -48,6 +48,36 @@ fn main() {
     storage::ensure_schema(&conn).expect("ensure schema");
     let audit = AuditLog::new(&audit_path);
 
+    println!("current meetings in the real database:");
+    for m in storage::list_meetings(&conn).expect("list meetings") {
+        println!("  id={} title={:?} status={} duration={}s", m.id, m.title, m.status, m.duration_secs);
+    }
+
+    // Crash recovery: a previous run of this same script can leave a
+    // meeting row stuck at 'processing' if the process aborted mid-way
+    // (a real llama.cpp assertion abort skips Rust's own failure-handling
+    // wrapper entirely, since it terminates the process rather than
+    // unwinding). Any non-ready row whose audio_path is under this run's
+    // own recordings directory is a leftover from a prior attempt at THIS
+    // migration, not real user data to protect — clear it so the retry
+    // below starts fresh instead of skipping (idempotency check further
+    // down only trusts a 'ready' status).
+    let stale_ids: Vec<i64> = conn
+        .prepare("SELECT id FROM meetings WHERE status != 'ready' AND audio_path LIKE ?1")
+        .unwrap()
+        .query_map([format!("{}%", new_recordings_dir.display())], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    for id in stale_ids {
+        println!("cleaning up stale non-ready meeting row from a previous attempt: id={id}");
+        conn.execute("DELETE FROM transcript_segments WHERE meeting_id = ?1", [id]).unwrap();
+        conn.execute("DELETE FROM meeting_summaries WHERE meeting_id = ?1", [id]).unwrap();
+        conn.execute("DELETE FROM action_items WHERE meeting_id = ?1", [id]).unwrap();
+        conn.execute("DELETE FROM meeting_embeddings WHERE meeting_id = ?1", [id]).unwrap();
+        conn.execute("DELETE FROM meetings WHERE id = ?1", [id]).unwrap();
+    }
+
     let mut wavs: Vec<PathBuf> = std::fs::read_dir(&old_recordings_dir)
         .expect("read old recordings dir")
         .filter_map(|e| e.ok())
@@ -65,6 +95,19 @@ fn main() {
         let stem = src.file_stem().unwrap().to_string_lossy();
         let dest_name = format!("imported-{stem}.wav");
         let dest = new_recordings_dir.join(&dest_name);
+
+        let already_ready: bool = conn
+            .query_row(
+                "SELECT 1 FROM meetings WHERE audio_path = ?1 AND status = 'ready'",
+                [dest.to_str().unwrap()],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        if already_ready {
+            println!("--- skipping {stem}: already imported and ready ---");
+            succeeded += 1;
+            continue;
+        }
 
         println!("--- importing {stem} ---");
 

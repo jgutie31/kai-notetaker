@@ -89,7 +89,21 @@ impl LlmEngine {
     /// tasks (summaries, action items) where reproducibility matters more
     /// than creative variance.
     pub fn complete(&self, prompt: &str, max_tokens: usize, n_ctx: u32) -> Result<String, LlmError> {
-        let ctx_params = LlamaContextParams::default().with_n_ctx(NonZeroU32::new(n_ctx));
+        // Real crash fixed here: `LlamaContextParams::default()` sets
+        // `n_batch` (max tokens processed in a single decode() call) to
+        // 2048 regardless of `n_ctx` (the total context window size) —
+        // they are independent parameters. The prompt is submitted as one
+        // batch below, so any prompt over 2048 tokens but still under a
+        // larger `n_ctx` hit llama.cpp's own internal assertion
+        // (`GGML_ASSERT(n_tokens_all <= cparams.n_batch)`) and aborted the
+        // whole process — confirmed via a real crash on a genuine 43-minute
+        // meeting transcript, not a hypothetical. `n_batch` must be at
+        // least as large as the longest single prompt this code submits,
+        // which is bounded by `n_ctx` itself (see the `PromptTooLong`
+        // check just below).
+        let ctx_params = LlamaContextParams::default()
+            .with_n_ctx(NonZeroU32::new(n_ctx))
+            .with_n_batch(n_ctx);
         let mut ctx = self
             .model
             .new_context(shared_backend(), ctx_params)
@@ -256,6 +270,31 @@ mod tests {
         let engine = LlmEngine::load(&path, 1000).unwrap();
         let result = engine.chunk_by_tokens("some text here", 50, 50);
         assert!(result.is_err());
+    }
+
+    // Real crash regression: a prompt over 2048 tokens (the old,
+    // never-explicitly-set n_batch default) but still under n_ctx used to
+    // abort the whole process via llama.cpp's own internal assertion —
+    // reproduced for real against a genuine 43-minute meeting transcript
+    // during the MeetingImport migration. This proves the fix
+    // (`with_n_batch(n_ctx)`) actually completes such a prompt instead of
+    // crashing.
+    #[test]
+    fn completes_a_prompt_longer_than_the_old_default_n_batch() {
+        let path = model_path();
+        if !path.exists() {
+            eprintln!("skipping: LLM model not present in this environment");
+            return;
+        }
+        let engine = LlmEngine::load(&path, 1000).unwrap();
+        // ~2500+ tokens of real English words — comfortably over the old
+        // 2048 n_batch default, comfortably under a 4096 n_ctx.
+        let long_prompt = format!(
+            "<|start_header_id|>user<|end_header_id|>\n\n{}\nReply with exactly the word: done<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n",
+            "the quick brown fox jumps over the lazy dog. ".repeat(300)
+        );
+        let output = engine.complete(&long_prompt, 20, 4096).unwrap();
+        assert!(!output.trim().is_empty(), "expected a real completion, not a crash");
     }
 
     #[test]
