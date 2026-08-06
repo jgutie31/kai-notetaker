@@ -21,8 +21,11 @@ pub enum KeychainError {
 }
 
 /// Fetches a previously-stored secret, or `None` if nothing is stored
-/// under this account name yet.
-fn get_secret(account: &str) -> Result<Option<Vec<u8>>, KeychainError> {
+/// under this account name yet. `pub(crate)` so `oauth.rs` can reuse the
+/// same secure-storage primitive for calendar tokens — one storage layer,
+/// not a second copy of the Keychain/Credential-Manager/Secret-Service
+/// wiring.
+pub(crate) fn get_secret(account: &str) -> Result<Option<Vec<u8>>, KeychainError> {
     let entry = Entry::new(SERVICE, account).map_err(|e| KeychainError::Access(e.to_string()))?;
     match entry.get_secret() {
         Ok(value) => Ok(Some(value)),
@@ -31,9 +34,21 @@ fn get_secret(account: &str) -> Result<Option<Vec<u8>>, KeychainError> {
     }
 }
 
-fn set_secret(account: &str, value: &[u8]) -> Result<(), KeychainError> {
+pub(crate) fn set_secret(account: &str, value: &[u8]) -> Result<(), KeychainError> {
     let entry = Entry::new(SERVICE, account).map_err(|e| KeychainError::Access(e.to_string()))?;
     entry.set_secret(value).map_err(|e| KeychainError::Access(e.to_string()))
+}
+
+/// Idempotent: deleting an account that was never stored is success, not
+/// an error — the caller's intent ("this account should not exist") is
+/// already satisfied either way.
+#[cfg(test)]
+pub(crate) fn delete_secret(account: &str) -> Result<(), KeychainError> {
+    let entry = Entry::new(SERVICE, account).map_err(|e| KeychainError::Access(e.to_string()))?;
+    match entry.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(e) => Err(KeychainError::Access(e.to_string())),
+    }
 }
 
 /// Returns the app's database encryption key, generating and persisting a

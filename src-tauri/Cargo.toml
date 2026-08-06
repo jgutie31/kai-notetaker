@@ -41,6 +41,15 @@ getrandom = "0.4.3"
 # storage, not macOS-only. Named explicitly even though it's the crate's
 # default feature set, so this stays self-documenting.
 keyring = { version = "4.1.6", features = ["v1"] }
+# For PKCE (RFC 7636) code_challenge generation — already resolved
+# transitively by other dependencies, added directly since oauth.rs needs
+# the API, not just the binary.
+sha2 = "0.10"
+base64 = "0.22"
+# Already resolved transitively via tauri-plugin-opener; added directly
+# since oauth connect flows need to open the provider's sign-in page in
+# the user's default browser without going through a Tauri command/AppHandle.
+open = "5.4.0"
 
 [dev-dependencies]
 tempfile = "3"

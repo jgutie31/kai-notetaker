@@ -4,10 +4,11 @@ import { RecordingControl } from "./components/RecordingControl";
 import { MeetingLibrary } from "./components/MeetingLibrary";
 import { MeetingDetail } from "./components/MeetingDetail";
 import { FirstRunSetup } from "./components/FirstRunSetup";
+import { CalendarSettings } from "./components/CalendarSettings";
 import "./styles/tokens.css";
 import "./App.css";
 
-type View = "recording" | "library";
+type View = "recording" | "library" | "calendar";
 
 const UNDO_WINDOW_MS = 8000;
 
@@ -88,17 +89,24 @@ function App() {
         >
           Meetings
         </button>
+        <button
+          type="button"
+          className={`app-nav__tab ${view === "calendar" ? "app-nav__tab--active" : ""}`}
+          onClick={() => setView("calendar")}
+        >
+          Calendar
+        </button>
       </nav>
       <div className="app-content">
-        {view === "recording" ? (
-          <RecordingControl />
-        ) : (
+        {view === "recording" && <RecordingControl />}
+        {view === "library" && (
           <MeetingLibrary
             onSelectMeeting={(id) => setSelectedMeetingId(id)}
             onDelete={handleDelete}
             refreshToken={refreshToken}
           />
         )}
+        {view === "calendar" && <CalendarSettings />}
         {undoToast}
       </div>
     </main>

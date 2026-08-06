@@ -5,6 +5,7 @@
 pub mod asr;
 mod audio_capture;
 pub mod audit_log;
+mod calendar;
 mod cloud_sync_gate;
 pub mod diarization;
 pub mod embeddings;
@@ -12,6 +13,7 @@ mod frontier;
 mod keychain;
 pub mod llm;
 pub mod model_provisioning;
+mod oauth;
 pub mod pipeline;
 mod retention;
 pub mod speaker_id;
@@ -243,6 +245,51 @@ fn reprocess_meeting_with_speaker_count(
     Ok(())
 }
 
+/// Stores the Microsoft app registration's client ID so it only needs to
+/// be entered once, then runs the full interactive OAuth consent flow
+/// (opens the user's browser, waits for the redirect, exchanges the code,
+/// stores tokens). Blocks the calling command for up to 3 minutes — fine
+/// for a rare, explicit "Connect" click, not something polled.
+#[tauri::command]
+fn connect_microsoft_calendar(client_id: String) -> Result<(), String> {
+    oauth::store_client_id(calendar::MICROSOFT_PROVIDER_ID, &client_id).map_err(|e| e.to_string())?;
+    // Fixed port, not random: this app only ever runs one connect flow at
+    // a time, and a fixed port makes the one-time "add http://localhost
+    // as a redirect URI" Azure step unambiguous to describe — Microsoft
+    // ignores the port for matching anyway (verified against their own
+    // docs), so this isn't load-bearing for correctness, just clarity.
+    calendar::connect_microsoft(&client_id, 53682).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn is_microsoft_calendar_connected() -> Result<bool, String> {
+    calendar::is_microsoft_connected().map_err(|e| e.to_string())
+}
+
+#[derive(serde::Serialize)]
+struct UpcomingMeetingPayload {
+    subject: String,
+    start: String,
+    end: String,
+    attendees: Vec<String>,
+    join_url: Option<String>,
+}
+
+#[tauri::command]
+fn list_upcoming_meetings(hours_ahead: i64) -> Result<Vec<UpcomingMeetingPayload>, String> {
+    let client_id = oauth::load_client_id(calendar::MICROSOFT_PROVIDER_ID)
+        .map_err(|e| e.to_string())?
+        .ok_or("Microsoft calendar isn't connected yet")?;
+    calendar::list_upcoming_meetings(&client_id, hours_ahead)
+        .map(|meetings| {
+            meetings
+                .into_iter()
+                .map(|m| UpcomingMeetingPayload { subject: m.subject, start: m.start, end: m.end, attendees: m.attendees, join_url: m.join_url })
+                .collect()
+        })
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 fn list_meetings(paths: State<AppPaths>) -> Result<Vec<storage::MeetingListItem>, String> {
     let db_path = paths.data_dir.join("kai-notetaker.sqlite3");
@@ -436,7 +483,10 @@ pub fn run() {
             undelete_meeting,
             list_known_speakers,
             label_transcript_segments,
-            reprocess_meeting_with_speaker_count
+            reprocess_meeting_with_speaker_count,
+            connect_microsoft_calendar,
+            is_microsoft_calendar_connected,
+            list_upcoming_meetings
         ])
         .setup(|app| {
             let data_dir = app
