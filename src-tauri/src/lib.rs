@@ -11,7 +11,7 @@ pub mod embeddings;
 mod frontier;
 mod keychain;
 pub mod llm;
-mod model_provisioning;
+pub mod model_provisioning;
 pub mod pipeline;
 mod retention;
 pub mod storage;
