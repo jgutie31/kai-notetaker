@@ -281,42 +281,68 @@ fn list_known_speakers(paths: State<AppPaths>) -> Result<Vec<String>, String> {
     Ok(storage::list_known_speakers(&conn).map_err(|e| e.to_string())?.into_iter().map(|(_, name)| name).collect())
 }
 
-/// Labels one diarized speaker within one meeting. `remember: true` also
-/// extracts a real voice sample from that speaker's actual audio and
-/// enrolls it — both in the database (so it survives a restart) and in
-/// the live `SpeakerIdEngine` (so it's recognized for the rest of this
-/// session immediately, no restart needed). `remember: false` just sets
-/// a one-off display label for this meeting, with no persistent identity
-/// attached — for a person you don't expect to see again.
+/// Labels one or more specific transcript segments. Scoped to exact
+/// segment ids (not a whole raw diarization speaker index) by default,
+/// because clustering can — and on real long calls, does — merge two
+/// different real people into the same index; an index-wide label would
+/// then silently mislabel whichever person didn't type the name. Set
+/// `apply_to_whole_speaker: true` to opt into the old, simpler behavior
+/// (label every segment sharing the first selected segment's raw index)
+/// for the common case where diarization got that index right.
+///
+/// `remember: true` also extracts a real voice sample from the selected
+/// audio (just the selected segments' own ranges, or the whole index's
+/// ranges when `apply_to_whole_speaker`) and enrolls it — both in the
+/// database (survives a restart) and in the live `SpeakerIdEngine`
+/// (recognized for the rest of this session immediately). `remember:
+/// false` just sets a display label with no persistent identity attached
+/// — for a person you don't expect to see again.
 #[tauri::command]
-fn label_meeting_speaker(
+fn label_transcript_segments(
     meeting_id: i64,
-    speaker_index: i32,
+    segment_ids: Vec<i64>,
     name: String,
     remember: bool,
+    apply_to_whole_speaker: bool,
     paths: State<AppPaths>,
     engines: State<EnginesState>,
 ) -> Result<(), String> {
+    if segment_ids.is_empty() {
+        return Err("no segments selected".to_string());
+    }
+
     let db_path = paths.data_dir.join("kai-notetaker.sqlite3");
     let conn = storage::open_connection(&db_path).map_err(|e| e.to_string())?;
+    let detail = storage::get_meeting_detail(&conn, meeting_id).map_err(|e| e.to_string())?;
+
+    let (ranges, whole_speaker_index): (Vec<(i64, i64)>, Option<i32>) = {
+        let selected: Vec<&storage::TranscriptSegmentRow> =
+            detail.transcript.iter().filter(|s| segment_ids.contains(&s.id)).collect();
+        if selected.is_empty() {
+            return Err("selected segments not found in this meeting".to_string());
+        }
+        if apply_to_whole_speaker {
+            let speaker_index = selected[0].speaker.ok_or("selected segment has no diarized speaker")?;
+            let ranges = detail
+                .transcript
+                .iter()
+                .filter(|s| s.speaker == Some(speaker_index))
+                .map(|s| (s.start_ms, s.end_ms))
+                .collect();
+            (ranges, Some(speaker_index))
+        } else {
+            (selected.iter().map(|s| (s.start_ms, s.end_ms)).collect(), None)
+        }
+    };
 
     if !remember {
-        storage::label_meeting_speaker(&conn, meeting_id, speaker_index, None, &name).map_err(|e| e.to_string())?;
-        return Ok(());
+        return match whole_speaker_index {
+            Some(speaker_index) => storage::label_meeting_speaker(&conn, meeting_id, speaker_index, None, &name).map_err(|e| e.to_string()),
+            None => storage::set_segment_speaker_labels(&conn, &segment_ids, None, &name).map_err(|e| e.to_string()),
+        };
     }
 
-    let detail = storage::get_meeting_detail(&conn, meeting_id).map_err(|e| e.to_string())?;
     let audio_path = detail.audio_path.ok_or("this meeting has no audio to extract a voice sample from")?;
-    let ranges: Vec<(i64, i64)> = detail
-        .transcript
-        .iter()
-        .filter(|s| s.speaker == Some(speaker_index))
-        .map(|s| (s.start_ms, s.end_ms))
-        .collect();
-    if ranges.is_empty() {
-        return Err(format!("no transcript segments found for speaker {speaker_index}"));
-    }
-
     let engines_guard = engines.0.lock().map_err(|_| "engines lock poisoned".to_string())?;
     let engines_ref = engines_guard.as_ref().ok_or("models are still loading — try again shortly")?;
 
@@ -329,7 +355,10 @@ fn label_meeting_speaker(
 
     let known_speaker_id = storage::get_or_create_known_speaker(&conn, &name).map_err(|e| e.to_string())?;
     storage::add_speaker_embedding_sample(&conn, known_speaker_id, &embedding, Some(meeting_id)).map_err(|e| e.to_string())?;
-    storage::label_meeting_speaker(&conn, meeting_id, speaker_index, Some(known_speaker_id), &name).map_err(|e| e.to_string())?;
+    match whole_speaker_index {
+        Some(speaker_index) => storage::label_meeting_speaker(&conn, meeting_id, speaker_index, Some(known_speaker_id), &name).map_err(|e| e.to_string())?,
+        None => storage::set_segment_speaker_labels(&conn, &segment_ids, Some(known_speaker_id), &name).map_err(|e| e.to_string())?,
+    }
     engines_ref.speaker_id.enroll(&name, &embedding);
 
     Ok(())
@@ -354,7 +383,7 @@ pub fn run() {
             delete_meeting,
             undelete_meeting,
             list_known_speakers,
-            label_meeting_speaker
+            label_transcript_segments
         ])
         .setup(|app| {
             let data_dir = app

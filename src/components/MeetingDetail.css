@@ -200,6 +200,10 @@
   color: var(--color-accent);
 }
 
+.transcript-line--selected {
+  background: rgba(200, 160, 60, 0.14);
+}
+
 .transcript-line__speaker {
   flex-shrink: 0;
   width: 84px;
@@ -216,13 +220,23 @@
   text-decoration-style: dotted;
 }
 
+.transcript-line__speaker--selected {
+  color: var(--color-accent);
+}
+
 .transcript-line__speaker-edit {
   flex-shrink: 0;
-  width: 200px;
+  width: 240px;
   display: flex;
   flex-direction: column;
   gap: var(--space-1);
   cursor: default;
+}
+
+.transcript-line__speaker-hint {
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--color-text-secondary);
 }
 
 .transcript-line__speaker-input {

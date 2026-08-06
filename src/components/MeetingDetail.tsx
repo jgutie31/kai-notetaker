@@ -3,6 +3,7 @@ import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import "./MeetingDetail.css";
 
 interface TranscriptSegmentRow {
+  id: number;
   speaker: number | null;
   speaker_label: string | null;
   start_ms: number;
@@ -71,9 +72,14 @@ export function MeetingDetail({ meetingId, onBack, onDelete }: MeetingDetailProp
   const [isEditingTitle, setIsEditingTitle] = useState(false);
   const [titleDraft, setTitleDraft] = useState("");
   const [knownSpeakers, setKnownSpeakers] = useState<string[]>([]);
-  const [editingSpeakerIndex, setEditingSpeakerIndex] = useState<number | null>(null);
+  // Transcript array indices (inclusive), not raw diarization speaker
+  // indices — diarization can merge two different real people into the
+  // same raw index on a real call, so editing is scoped to the exact lines
+  // selected, not "every line diarization ever called this index."
+  const [editingRange, setEditingRange] = useState<{ start: number; end: number } | null>(null);
   const [speakerNameDraft, setSpeakerNameDraft] = useState("");
   const [rememberSpeaker, setRememberSpeaker] = useState(true);
+  const [applyToWholeSpeaker, setApplyToWholeSpeaker] = useState(false);
   const [labelingInFlight, setLabelingInFlight] = useState(false);
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
@@ -155,37 +161,57 @@ export function MeetingDetail({ meetingId, onBack, onDelete }: MeetingDetailProp
       .catch((e) => setError(String(e)));
   };
 
-  const startEditingSpeaker = (e: React.MouseEvent, seg: TranscriptSegmentRow) => {
+  // Plain click selects just this one line. Shift+click while a selection
+  // is already open extends it to a range — lets a long mislabeled stretch
+  // (diarization gave no index change at the real turn boundary) be fixed
+  // in one action without dragging in unrelated lines that happen to share
+  // the same raw speaker index elsewhere in the call.
+  const startEditingSpeaker = (e: React.MouseEvent, seg: TranscriptSegmentRow, index: number) => {
     e.stopPropagation();
     if (seg.speaker === null) return;
-    setEditingSpeakerIndex(seg.speaker);
+    if (e.shiftKey && editingRange) {
+      setEditingRange({ start: Math.min(editingRange.start, index), end: Math.max(editingRange.end, index) });
+      return;
+    }
+    setEditingRange({ start: index, end: index });
     setSpeakerNameDraft(seg.speaker_label ?? "");
     setRememberSpeaker(true);
+    setApplyToWholeSpeaker(false);
   };
 
   const commitSpeakerLabel = () => {
-    if (!detail || editingSpeakerIndex === null) return;
+    if (!detail || !editingRange) return;
     const name = speakerNameDraft.trim();
-    const speakerIndex = editingSpeakerIndex;
     if (!name) {
-      setEditingSpeakerIndex(null);
+      setEditingRange(null);
       return;
     }
+    const selected = detail.transcript.slice(editingRange.start, editingRange.end + 1);
+    const segmentIds = selected.map((s) => s.id);
+    const wholeSpeakerIndex = applyToWholeSpeaker ? selected[0].speaker : null;
     setLabelingInFlight(true);
-    invoke("label_meeting_speaker", { meetingId: detail.id, speakerIndex, name, remember: rememberSpeaker })
+    invoke("label_transcript_segments", {
+      meetingId: detail.id,
+      segmentIds,
+      name,
+      remember: rememberSpeaker,
+      applyToWholeSpeaker,
+    })
       .then(() => {
-        setDetail((prev) =>
-          prev
-            ? {
-                ...prev,
-                transcript: prev.transcript.map((s) => (s.speaker === speakerIndex ? { ...s, speaker_label: name } : s)),
-              }
-            : prev,
-        );
+        setDetail((prev) => {
+          if (!prev) return prev;
+          const idSet = new Set(segmentIds);
+          return {
+            ...prev,
+            transcript: prev.transcript.map((s) =>
+              wholeSpeakerIndex !== null ? (s.speaker === wholeSpeakerIndex ? { ...s, speaker_label: name } : s) : idSet.has(s.id) ? { ...s, speaker_label: name } : s,
+            ),
+          };
+        });
         if (rememberSpeaker && !knownSpeakers.includes(name)) {
           setKnownSpeakers((prev) => [...prev, name].sort());
         }
-        setEditingSpeakerIndex(null);
+        setEditingRange(null);
       })
       .catch((e) => setError(String(e)))
       .finally(() => setLabelingInFlight(false));
@@ -371,54 +397,64 @@ export function MeetingDetail({ meetingId, onBack, onDelete }: MeetingDetailProp
           />
           <div className="detail-screen__transcript">
             <h2 className="detail-section__heading">Transcript</h2>
-            {detail.transcript.map((seg, i) => (
-              <div
-                key={i}
-                ref={(el) => {
-                  segmentRefs.current[i] = el;
-                }}
-                className={`transcript-line ${i === activeIndex ? "transcript-line--active" : ""} ${
-                  detail.audio_path ? "transcript-line--clickable" : ""
-                }`}
-                onClick={() => detail.audio_path && seekTo(seg.start_ms)}
-              >
-                {editingSpeakerIndex === seg.speaker ? (
-                  <span className="transcript-line__speaker-edit" onClick={(e) => e.stopPropagation()}>
-                    <input
-                      type="text"
-                      autoFocus
-                      list="known-speakers-list"
-                      className="transcript-line__speaker-input"
-                      placeholder="Name"
-                      value={speakerNameDraft}
-                      onChange={(e) => setSpeakerNameDraft(e.target.value)}
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter") commitSpeakerLabel();
-                        if (e.key === "Escape") setEditingSpeakerIndex(null);
-                      }}
-                    />
-                    <label className="transcript-line__speaker-remember">
-                      <input type="checkbox" checked={rememberSpeaker} onChange={(e) => setRememberSpeaker(e.target.checked)} />
-                      Remember
-                    </label>
-                    <button type="button" disabled={labelingInFlight} onClick={commitSpeakerLabel}>
-                      Save
-                    </button>
-                  </span>
-                ) : (
-                  <span
-                    className="transcript-line__speaker transcript-line__speaker--editable"
-                    onClick={(e) => startEditingSpeaker(e, seg)}
-                    title="Click to name this speaker"
-                  >
-                    {seg.speaker_label ?? (seg.speaker !== null ? `Speaker ${seg.speaker}` : "—")}
-                    <br />
-                    {formatTimestamp(seg.start_ms)}
-                  </span>
-                )}
-                <span className="transcript-line__text">{seg.text}</span>
-              </div>
-            ))}
+            {detail.transcript.map((seg, i) => {
+              const inRange = editingRange !== null && i >= editingRange.start && i <= editingRange.end;
+              const isEditFormRow = editingRange !== null && i === editingRange.end;
+              const rangeSize = editingRange ? editingRange.end - editingRange.start + 1 : 0;
+              return (
+                <div
+                  key={seg.id}
+                  ref={(el) => {
+                    segmentRefs.current[i] = el;
+                  }}
+                  className={`transcript-line ${i === activeIndex ? "transcript-line--active" : ""} ${
+                    inRange ? "transcript-line--selected" : ""
+                  } ${detail.audio_path ? "transcript-line--clickable" : ""}`}
+                  onClick={() => detail.audio_path && seekTo(seg.start_ms)}
+                >
+                  {isEditFormRow ? (
+                    <span className="transcript-line__speaker-edit" onClick={(e) => e.stopPropagation()}>
+                      <input
+                        type="text"
+                        autoFocus
+                        list="known-speakers-list"
+                        className="transcript-line__speaker-input"
+                        placeholder="Name"
+                        value={speakerNameDraft}
+                        onChange={(e) => setSpeakerNameDraft(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") commitSpeakerLabel();
+                          if (e.key === "Escape") setEditingRange(null);
+                        }}
+                      />
+                      {rangeSize > 1 && <div className="transcript-line__speaker-hint">Labeling {rangeSize} lines</div>}
+                      <label className="transcript-line__speaker-remember">
+                        <input type="checkbox" checked={rememberSpeaker} onChange={(e) => setRememberSpeaker(e.target.checked)} />
+                        Remember
+                      </label>
+                      <label className="transcript-line__speaker-remember">
+                        <input type="checkbox" checked={applyToWholeSpeaker} onChange={(e) => setApplyToWholeSpeaker(e.target.checked)} />
+                        Apply everywhere diarization called this Speaker {seg.speaker}
+                      </label>
+                      <button type="button" disabled={labelingInFlight} onClick={commitSpeakerLabel}>
+                        Save
+                      </button>
+                    </span>
+                  ) : (
+                    <span
+                      className={`transcript-line__speaker transcript-line__speaker--editable ${inRange ? "transcript-line__speaker--selected" : ""}`}
+                      onClick={(e) => startEditingSpeaker(e, seg, i)}
+                      title="Click to name this speaker. Shift+click another line to select a range."
+                    >
+                      {seg.speaker_label ?? (seg.speaker !== null ? `Speaker ${seg.speaker}` : "—")}
+                      <br />
+                      {formatTimestamp(seg.start_ms)}
+                    </span>
+                  )}
+                  <span className="transcript-line__text">{seg.text}</span>
+                </div>
+              );
+            })}
           </div>
         </>
       )}

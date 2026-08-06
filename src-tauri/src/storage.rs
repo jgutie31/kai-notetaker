@@ -208,6 +208,13 @@ pub fn ensure_schema(conn: &Connection) -> Result<(), StorageError> {
             PRIMARY KEY(meeting_id, speaker_index),
             FOREIGN KEY(meeting_id) REFERENCES meetings(id),
             FOREIGN KEY(known_speaker_id) REFERENCES known_speakers(id)
+         );
+         CREATE TABLE IF NOT EXISTS transcript_segment_speaker_overrides (
+            segment_id INTEGER PRIMARY KEY,
+            known_speaker_id INTEGER,
+            label TEXT NOT NULL,
+            FOREIGN KEY(segment_id) REFERENCES transcript_segments(id),
+            FOREIGN KEY(known_speaker_id) REFERENCES known_speakers(id)
          );",
     )?;
     apply_column_migrations(conn)?;
@@ -395,6 +402,44 @@ pub fn get_meeting_speaker_labels(conn: &Connection, meeting_id: i64) -> Result<
     rows.collect::<Result<std::collections::HashMap<_, _>, _>>().map_err(StorageError::from)
 }
 
+/// Labels specific transcript segments directly, overriding whatever the
+/// raw diarization speaker_index would otherwise resolve to for those rows
+/// only. Exists because diarization's clustering can (and, on real long
+/// calls, does) merge two different real speakers into the same raw index —
+/// an index-wide label would then mislabel one of them. Scoping to exact
+/// segment ids lets a human correct just the wrongly-clustered stretch
+/// without touching other segments that share the same raw index but are
+/// actually a different person.
+pub fn set_segment_speaker_labels(
+    conn: &Connection,
+    segment_ids: &[i64],
+    known_speaker_id: Option<i64>,
+    label: &str,
+) -> Result<(), StorageError> {
+    for segment_id in segment_ids {
+        conn.execute(
+            "INSERT INTO transcript_segment_speaker_overrides (segment_id, known_speaker_id, label)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(segment_id) DO UPDATE SET known_speaker_id = ?2, label = ?3",
+            rusqlite::params![segment_id, known_speaker_id, label],
+        )?;
+    }
+    Ok(())
+}
+
+/// Per-segment label overrides for one meeting, keyed by segment id — takes
+/// precedence over the index-wide `meeting_speaker_labels` resolution in
+/// `get_meeting_detail`.
+pub fn get_segment_speaker_overrides(conn: &Connection, meeting_id: i64) -> Result<std::collections::HashMap<i64, String>, StorageError> {
+    let mut stmt = conn.prepare(
+        "SELECT tso.segment_id, tso.label FROM transcript_segment_speaker_overrides tso
+         JOIN transcript_segments ts ON ts.id = tso.segment_id
+         WHERE ts.meeting_id = ?1",
+    )?;
+    let rows = stmt.query_map([meeting_id], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))?;
+    rows.collect::<Result<std::collections::HashMap<_, _>, _>>().map_err(StorageError::from)
+}
+
 pub fn list_known_speakers(conn: &Connection) -> Result<Vec<(i64, String)>, StorageError> {
     let mut stmt = conn.prepare("SELECT id, name FROM known_speakers ORDER BY name")?;
     let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
@@ -457,9 +502,12 @@ pub fn list_meetings(conn: &Connection) -> Result<Vec<MeetingListItem>, StorageE
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TranscriptSegmentRow {
+    pub id: i64,
     pub speaker: Option<i32>,
-    /// Resolved display name for `speaker`, if this meeting's speaker
-    /// index has been labeled (auto-matched or manually assigned).
+    /// Resolved display name for `speaker`. Resolution order: an explicit
+    /// per-segment override (`transcript_segment_speaker_overrides`) wins
+    /// first, since it corrects a specific diarization mistake; otherwise
+    /// falls back to the index-wide `meeting_speaker_labels` entry, if any.
     /// `None` means the frontend should fall back to "Speaker N".
     pub speaker_label: Option<String>,
     pub start_ms: i64,
@@ -506,19 +554,26 @@ pub fn get_meeting_detail(conn: &Connection, meeting_id: i64) -> Result<MeetingD
         .ok();
 
     let speaker_labels = get_meeting_speaker_labels(conn, meeting_id)?;
+    let segment_overrides = get_segment_speaker_overrides(conn, meeting_id)?;
 
     let mut stmt = conn.prepare(
-        "SELECT speaker, start_ms, end_ms, text FROM transcript_segments WHERE meeting_id = ?1 ORDER BY segment_index ASC",
+        "SELECT id, speaker, start_ms, end_ms, text FROM transcript_segments WHERE meeting_id = ?1 ORDER BY segment_index ASC",
     )?;
     let transcript = stmt
         .query_map([meeting_id], |row| {
-            let speaker: Option<i32> = row.get(0)?;
+            let id: i64 = row.get(0)?;
+            let speaker: Option<i32> = row.get(1)?;
+            let speaker_label = segment_overrides
+                .get(&id)
+                .cloned()
+                .or_else(|| speaker.and_then(|s| speaker_labels.get(&s).cloned()));
             Ok(TranscriptSegmentRow {
+                id,
                 speaker,
-                speaker_label: speaker.and_then(|s| speaker_labels.get(&s).cloned()),
-                start_ms: row.get(1)?,
-                end_ms: row.get(2)?,
-                text: row.get(3)?,
+                speaker_label,
+                start_ms: row.get(2)?,
+                end_ms: row.get(3)?,
+                text: row.get(4)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -856,6 +911,70 @@ mod tests {
 
         let detail = get_meeting_detail(&conn, meeting_id).unwrap();
         assert_eq!(detail.transcript[0].speaker_label, None);
+    }
+
+    #[test]
+    fn segment_override_corrects_a_diarization_merge_without_touching_the_other_speaker() {
+        // Reproduces the real bug: a raw diarization index (0) that
+        // actually contains two different people — one early in the call,
+        // one later — because the clustering step never detected a turn
+        // boundary between them. An index-wide label would mislabel
+        // whichever person didn't get to type their own name.
+        let conn = test_db();
+        let meeting_id = create_meeting(&conn, "a.wav", 3000).unwrap();
+        mark_meeting_ready(&conn, meeting_id, "Merged Speakers Call").unwrap();
+        insert_transcript_segment(&conn, meeting_id, 0, Some(0), 0, 1000, "Jeremiah's first line").unwrap();
+        insert_transcript_segment(&conn, meeting_id, 1, Some(0), 1000, 2000, "Jeremiah's second line").unwrap();
+        insert_transcript_segment(&conn, meeting_id, 2, Some(0), 420_000, 430_000, "Dave's first line, misclustered as the same index").unwrap();
+        insert_transcript_segment(&conn, meeting_id, 3, Some(0), 430_000, 440_000, "Dave's second line, misclustered as the same index").unwrap();
+
+        let before = get_meeting_detail(&conn, meeting_id).unwrap();
+        let dave_segment_ids: Vec<i64> = before.transcript[2..4].iter().map(|s| s.id).collect();
+
+        let dave_id = get_or_create_known_speaker(&conn, "Dave").unwrap();
+        set_segment_speaker_labels(&conn, &dave_segment_ids, Some(dave_id), "Dave").unwrap();
+
+        let after = get_meeting_detail(&conn, meeting_id).unwrap();
+        assert_eq!(after.transcript[0].speaker_label, None, "Jeremiah's first line must stay unlabeled, not become Dave");
+        assert_eq!(after.transcript[1].speaker_label, None, "Jeremiah's second line must stay unlabeled, not become Dave");
+        assert_eq!(after.transcript[2].speaker_label.as_deref(), Some("Dave"));
+        assert_eq!(after.transcript[3].speaker_label.as_deref(), Some("Dave"));
+
+        // Now label Jeremiah's two lines by segment id too — proves the two
+        // real people sharing raw index 0 can each be corrected
+        // independently, which is the whole point of the fix.
+        let jeremiah_id = get_or_create_known_speaker(&conn, "Jeremiah").unwrap();
+        let jeremiah_segment_ids: Vec<i64> = before.transcript[0..2].iter().map(|s| s.id).collect();
+        set_segment_speaker_labels(&conn, &jeremiah_segment_ids, Some(jeremiah_id), "Jeremiah").unwrap();
+
+        let final_detail = get_meeting_detail(&conn, meeting_id).unwrap();
+        assert_eq!(final_detail.transcript[0].speaker_label.as_deref(), Some("Jeremiah"));
+        assert_eq!(final_detail.transcript[1].speaker_label.as_deref(), Some("Jeremiah"));
+        assert_eq!(final_detail.transcript[2].speaker_label.as_deref(), Some("Dave"));
+        assert_eq!(final_detail.transcript[3].speaker_label.as_deref(), Some("Dave"));
+    }
+
+    #[test]
+    fn segment_override_takes_precedence_over_index_wide_label() {
+        let conn = test_db();
+        let meeting_id = create_meeting(&conn, "a.wav", 10).unwrap();
+        mark_meeting_ready(&conn, meeting_id, "Real Meeting").unwrap();
+        insert_transcript_segment(&conn, meeting_id, 0, Some(0), 0, 1000, "hello").unwrap();
+        insert_transcript_segment(&conn, meeting_id, 1, Some(0), 1000, 2000, "actually someone else").unwrap();
+
+        // Index-wide label says the whole index is "Jeremiah"...
+        let jeremiah_id = get_or_create_known_speaker(&conn, "Jeremiah").unwrap();
+        label_meeting_speaker(&conn, meeting_id, 0, Some(jeremiah_id), "Jeremiah").unwrap();
+
+        // ...but a specific segment override corrects just the second line.
+        let detail = get_meeting_detail(&conn, meeting_id).unwrap();
+        let second_segment_id = detail.transcript[1].id;
+        let dave_id = get_or_create_known_speaker(&conn, "Dave").unwrap();
+        set_segment_speaker_labels(&conn, &[second_segment_id], Some(dave_id), "Dave").unwrap();
+
+        let resolved = get_meeting_detail(&conn, meeting_id).unwrap();
+        assert_eq!(resolved.transcript[0].speaker_label.as_deref(), Some("Jeremiah"), "unoverridden segment still resolves via the index-wide label");
+        assert_eq!(resolved.transcript[1].speaker_label.as_deref(), Some("Dave"), "segment override wins over the index-wide label");
     }
 
     #[test]
