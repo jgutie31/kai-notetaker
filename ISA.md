@@ -5,10 +5,10 @@ project: kai-notetaker
 effort: deep
 effort_source: classifier
 phase: execute
-progress: 126/156
+progress: 129/158
 mode: interactive
 started: 2026-08-05T13:36:00Z
-updated: 2026-08-06T14:15:00Z
+updated: 2026-08-06T23:20:00Z
 ---
 
 ## Problem
@@ -248,7 +248,9 @@ Ship a Tauri desktop app whose Rust core has a working, unit-tested hash-chained
 - [x] ISC-153: The Graph `calendarView` event JSON parser's field names (`subject`, `start`/`end.dateTime`, `attendees[].emailAddress.{name,address}`, `onlineMeeting.joinUrl`) were verified against Microsoft's live Event resource documentation before writing the struct, not guessed — a real test parses a response shaped exactly like that documented schema, including the documented null-name/no-online-meeting edge cases (probe: `parses_a_real_graph_shaped_response_into_upcoming_meetings`).
 - [x] ISC-154: `get_valid_access_token` transparently refreshes an expiring token (within 60s of `expires_at`) before returning it, so calendar-list callers never see a stale-token failure from normal use; a refresh response that omits `refresh_token` (the documented Microsoft/Google behavior — it doesn't rotate) preserves the original rather than losing it (probe: `refresh_preserves_the_original_refresh_token_when_the_response_omits_it`).
 - [x] ISC-155: Tauri commands (`connect_microsoft_calendar`, `is_microsoft_calendar_connected`, `list_upcoming_meetings`) and a minimal "Calendar" tab in the app (paste client ID → Connect → real browser consent → list upcoming meetings with attendees/join link) exist so Jeremiah can drive the whole flow from the app itself once he has a real Azure client ID — not something requiring a terminal (probe: `lib.rs` command handlers + `CalendarSettings.tsx`; `bunx tsc --noEmit` exit 0).
-- [ ] ISC-156: Anti: the end-to-end live flow (real browser consent against a real Azure app registration, real Microsoft Graph calendar data returned) has NOT been run — this requires Jeremiah's own Azure App Registration and client ID, which only he can create. DEFERRED-VERIFY, follow-up: next session once he provides a real client ID.
+- [x] ISC-156: The end-to-end live flow has been run for real (2026-08-06): Jeremiah created a real Azure App Registration, pasted his real client ID into the Calendar tab, completed real browser consent against Microsoft, and the app listed his real upcoming meetings (two created same-day, one a week out) via the real Graph API. Verified via Keychain timestamps, not just Jeremiah's report: `calendar-client-id:microsoft` and `calendar-tokens:microsoft` entries were both created within this session, 8 seconds apart — client ID stored, then a real token immediately after, the exact sequence of a genuine completed consent flow (not stale test data — see ISC-157 below for why that distinction mattered).
+- [x] ISC-157: A stale real Keychain entry (`calendar-tokens:microsoft`, dated ~17:31 UTC the same day, predating the test suite's now-real-provider-avoidance discipline) was found causing `is_microsoft_calendar_connected` to report "Connected" before any real OAuth flow had ever run — a false positive surfaced by Jeremiah noticing the app already said "Connected" on first launch. Root-caused via Keychain item timestamps (not guessed) and deleted (`security delete-generic-password`) before the real first connect. Anti: no client-id entry existed alongside the stale token, confirming it was leftover dev/test residue rather than a real prior connection.
+- [x] ISC-158: The upcoming-meetings window is user-adjustable (2/7/14/30 days via a `<select>` in `CalendarSettings.tsx`, default 7) rather than a silent hardcoded 48 hours — found by Jeremiah in the same real session: he had a meeting a week out that the old 48h window hid entirely with no indication anything was cut off. `hoursAhead` is now `windowDays * 24`, driven by the selector; `bunx tsc --noEmit` exit 0.
 
 ### UI/UX (deferred until hard gates pass — placeholder ISCs for the eventual ideal state)
 
@@ -468,7 +470,7 @@ Ship a Tauri desktop app whose Rust core has a working, unit-tested hash-chained
 
 - name: CalendarOAuth
   description: Generic OAuth2+PKCE engine plus a Microsoft/Outlook calendar provider — real upcoming-meeting data, portable across any Microsoft account
-  satisfies: [ISC-146, ISC-147, ISC-148, ISC-149, ISC-150, ISC-151, ISC-152, ISC-153, ISC-154, ISC-155, ISC-156]
+  satisfies: [ISC-146, ISC-147, ISC-148, ISC-149, ISC-150, ISC-151, ISC-152, ISC-153, ISC-154, ISC-155, ISC-156, ISC-157, ISC-158]
   depends_on: [StorageLayer]
   parallelizable: true
 ```

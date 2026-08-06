@@ -17,6 +17,7 @@ export function CalendarSettings() {
   const [error, setError] = useState<string | null>(null);
   const [meetings, setMeetings] = useState<UpcomingMeeting[] | null>(null);
   const [loadingMeetings, setLoadingMeetings] = useState(false);
+  const [windowDays, setWindowDays] = useState(7);
 
   useEffect(() => {
     invoke<boolean>("is_microsoft_calendar_connected")
@@ -44,7 +45,7 @@ export function CalendarSettings() {
   const handleListMeetings = () => {
     setLoadingMeetings(true);
     setError(null);
-    invoke<UpcomingMeeting[]>("list_upcoming_meetings", { hoursAhead: 48 })
+    invoke<UpcomingMeeting[]>("list_upcoming_meetings", { hoursAhead: windowDays * 24 })
       .then(setMeetings)
       .catch((e) => setError(String(e)))
       .finally(() => setLoadingMeetings(false));
@@ -80,12 +81,25 @@ export function CalendarSettings() {
       ) : (
         <div className="calendar-settings__connected">
           <p className="calendar-settings__status">✓ Connected</p>
+          <div className="calendar-settings__window">
+            <label htmlFor="calendar-window-select">Show meetings within:</label>
+            <select
+              id="calendar-window-select"
+              value={windowDays}
+              onChange={(e) => setWindowDays(Number(e.target.value))}
+            >
+              <option value={2}>2 days</option>
+              <option value={7}>7 days</option>
+              <option value={14}>14 days</option>
+              <option value={30}>30 days</option>
+            </select>
+          </div>
           <button type="button" disabled={loadingMeetings} onClick={handleListMeetings}>
-            {loadingMeetings ? "Loading…" : "Show upcoming meetings (next 48h)"}
+            {loadingMeetings ? "Loading…" : `Show upcoming meetings (next ${windowDays}d)`}
           </button>
           {meetings && (
             <ul className="calendar-settings__meetings">
-              {meetings.length === 0 && <li className="calendar-settings__meeting">Nothing on the calendar in the next 48 hours.</li>}
+              {meetings.length === 0 && <li className="calendar-settings__meeting">Nothing on the calendar in the next {windowDays} days.</li>}
               {meetings.map((m, i) => (
                 <li key={i} className="calendar-settings__meeting">
                   <div className="calendar-settings__meeting-subject">{m.subject}</div>
