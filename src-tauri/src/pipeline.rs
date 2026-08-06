@@ -131,14 +131,24 @@ fn read_wav_mono_resampled(path: &Path) -> Result<Vec<f32>, PipelineError> {
 /// marked `failed` with the error message rather than left stuck at
 /// `processing` forever — callers don't need to remember to do this
 /// themselves.
+/// `diarization_override`: `None` uses the shared, long-lived diarization
+/// engine on `engines` (unknown speaker count — the normal case). `Some`
+/// substitutes a different, caller-constructed engine for just this one
+/// call — used when the real speaker count is known and a fresh engine was
+/// built with that exact count (see `DiarizationEngine::load`'s
+/// `num_speakers` param). Kept separate from `PipelineEngines` because the
+/// shared engines are loaded once at startup and reused across every
+/// recording; a known-count override is a rare, per-meeting, explicit
+/// user action, not something worth reloading the shared engine for.
 pub fn process_meeting(
     conn: &Connection,
     audit: &AuditLog,
     engines: &PipelineEngines,
     meeting_id: i64,
     audio_path: &Path,
+    diarization_override: Option<&DiarizationEngine>,
 ) -> Result<(), PipelineError> {
-    match process_meeting_inner(conn, audit, engines, meeting_id, audio_path) {
+    match process_meeting_inner(conn, audit, engines, meeting_id, audio_path, diarization_override) {
         Ok(()) => Ok(()),
         Err(e) => {
             let _ = storage::mark_meeting_failed(conn, meeting_id, &e.to_string());
@@ -153,11 +163,13 @@ fn process_meeting_inner(
     engines: &PipelineEngines,
     meeting_id: i64,
     audio_path: &Path,
+    diarization_override: Option<&DiarizationEngine>,
 ) -> Result<(), PipelineError> {
     let samples_16k = read_wav_mono_resampled(audio_path)?;
+    let diarization_engine = diarization_override.unwrap_or(&engines.diarization);
 
     let asr_segments = engines.asr.transcribe(&samples_16k)?;
-    let speaker_segments = engines.diarization.diarize(&samples_16k)?;
+    let speaker_segments = diarization_engine.diarize(&samples_16k)?;
     let merged = diarization::merge_asr_and_diarization(&asr_segments, &speaker_segments);
 
     for (i, (segment, speaker)) in merged.iter().enumerate() {
@@ -310,6 +322,7 @@ mod tests {
             diarization: DiarizationEngine::load(
                 &base.join("models/diarization/sherpa-onnx-pyannote-segmentation-3-0/model.onnx"),
                 &base.join("models/diarization/speaker-embedding.onnx"),
+                None,
             )
             .unwrap(),
             llm: LlmEngine::load(&base.join("models/llm/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"), 1000).unwrap(),
@@ -325,7 +338,7 @@ mod tests {
         std::fs::remove_file(audit_tmp.path()).ok();
         let audit = AuditLog::new(audit_tmp.path());
 
-        process_meeting(&conn, &audit, &engines, meeting_id, &fixture).unwrap();
+        process_meeting(&conn, &audit, &engines, meeting_id, &fixture, None).unwrap();
 
         let detail = storage::get_meeting_detail(&conn, meeting_id).unwrap();
         assert_eq!(detail.status, "ready");
@@ -367,6 +380,7 @@ mod tests {
             diarization: DiarizationEngine::load(
                 &base.join("models/diarization/sherpa-onnx-pyannote-segmentation-3-0/model.onnx"),
                 &base.join("models/diarization/speaker-embedding.onnx"),
+                None,
             )
             .unwrap(),
             llm: LlmEngine::load(&base.join("models/llm/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"), 1000).unwrap(),
@@ -383,7 +397,7 @@ mod tests {
         // First meeting: nobody enrolled yet, so this must fall back to
         // "Speaker N" everywhere, not silently guess a name.
         let meeting_1 = storage::create_meeting(&conn, fixture.to_str().unwrap(), 3).unwrap();
-        process_meeting(&conn, &audit, &engines, meeting_1, &fixture).unwrap();
+        process_meeting(&conn, &audit, &engines, meeting_1, &fixture, None).unwrap();
         let detail_1 = storage::get_meeting_detail(&conn, meeting_1).unwrap();
         let first_speaker_index = detail_1.transcript.iter().find_map(|s| s.speaker).expect("expected at least one diarized speaker");
         assert!(
@@ -404,7 +418,7 @@ mod tests {
         // Second meeting, same voice: should now auto-resolve with zero
         // manual labeling.
         let meeting_2 = storage::create_meeting(&conn, fixture.to_str().unwrap(), 3).unwrap();
-        process_meeting(&conn, &audit, &engines, meeting_2, &fixture).unwrap();
+        process_meeting(&conn, &audit, &engines, meeting_2, &fixture, None).unwrap();
         let detail_2 = storage::get_meeting_detail(&conn, meeting_2).unwrap();
         assert!(
             detail_2.transcript.iter().any(|s| s.speaker_label.as_deref() == Some("Test Speaker")),
@@ -442,6 +456,7 @@ mod tests {
             diarization: DiarizationEngine::load(
                 &base.join("models/diarization/sherpa-onnx-pyannote-segmentation-3-0/model.onnx"),
                 &base.join("models/diarization/speaker-embedding.onnx"),
+                None,
             )
             .unwrap(),
             llm: LlmEngine::load(&base.join("models/llm/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"), 1000).unwrap(),
@@ -449,7 +464,7 @@ mod tests {
             speaker_id: SpeakerIdEngine::load(&base.join("models/diarization/speaker-embedding.onnx")).unwrap(),
         };
 
-        let result = process_meeting(&conn, &audit, &engines, meeting_id, Path::new("/nonexistent/path.wav"));
+        let result = process_meeting(&conn, &audit, &engines, meeting_id, Path::new("/nonexistent/path.wav"), None);
         assert!(result.is_err());
 
         let detail = storage::get_meeting_detail(&conn, meeting_id).unwrap();

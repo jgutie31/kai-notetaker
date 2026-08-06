@@ -261,6 +261,15 @@ pub fn mark_meeting_ready(conn: &Connection, meeting_id: i64, title: &str) -> Re
     Ok(())
 }
 
+/// Resets a meeting back to `processing` with a clean title, for a
+/// reprocess run — mirrors the state a meeting is in right after
+/// `create_meeting`, so `process_meeting` can't tell the difference
+/// between a first run and a reprocess.
+pub fn mark_meeting_processing(conn: &Connection, meeting_id: i64) -> Result<(), StorageError> {
+    conn.execute("UPDATE meetings SET status = 'processing', title = NULL WHERE id = ?1", [meeting_id])?;
+    Ok(())
+}
+
 pub fn mark_meeting_failed(conn: &Connection, meeting_id: i64, error_message: &str) -> Result<(), StorageError> {
     conn.execute(
         "UPDATE meetings SET status = 'failed', error_message = ?1 WHERE id = ?2",
@@ -438,6 +447,26 @@ pub fn get_segment_speaker_overrides(conn: &Connection, meeting_id: i64) -> Resu
     )?;
     let rows = stmt.query_map([meeting_id], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))?;
     rows.collect::<Result<std::collections::HashMap<_, _>, _>>().map_err(StorageError::from)
+}
+
+/// Clears everything a reprocess regenerates from scratch: transcript,
+/// summary, action items, embeddings, and index-wide speaker labels (which
+/// are meaningless once diarization re-runs and produces new, unrelated
+/// indices). Per-segment overrides are cleared too, since the transcript
+/// segments they key off of are about to be deleted along with everything
+/// else. Shared by the reprocess CLI and the known-speaker-count reprocess
+/// command so both regenerate from the same clean slate.
+pub fn clear_meeting_processing_data(conn: &Connection, meeting_id: i64) -> Result<(), StorageError> {
+    conn.execute(
+        "DELETE FROM transcript_segment_speaker_overrides WHERE segment_id IN (SELECT id FROM transcript_segments WHERE meeting_id = ?1)",
+        [meeting_id],
+    )?;
+    conn.execute("DELETE FROM transcript_segments WHERE meeting_id = ?1", [meeting_id])?;
+    conn.execute("DELETE FROM meeting_summaries WHERE meeting_id = ?1", [meeting_id])?;
+    conn.execute("DELETE FROM action_items WHERE meeting_id = ?1", [meeting_id])?;
+    conn.execute("DELETE FROM meeting_embeddings WHERE meeting_id = ?1", [meeting_id])?;
+    conn.execute("DELETE FROM meeting_speaker_labels WHERE meeting_id = ?1", [meeting_id])?;
+    Ok(())
 }
 
 pub fn list_known_speakers(conn: &Connection) -> Result<Vec<(i64, String)>, StorageError> {
@@ -975,6 +1004,30 @@ mod tests {
         let resolved = get_meeting_detail(&conn, meeting_id).unwrap();
         assert_eq!(resolved.transcript[0].speaker_label.as_deref(), Some("Jeremiah"), "unoverridden segment still resolves via the index-wide label");
         assert_eq!(resolved.transcript[1].speaker_label.as_deref(), Some("Dave"), "segment override wins over the index-wide label");
+    }
+
+    #[test]
+    fn clear_meeting_processing_data_removes_everything_a_reprocess_regenerates() {
+        let conn = test_db();
+        let meeting_id = create_meeting(&conn, "a.wav", 10).unwrap();
+        mark_meeting_ready(&conn, meeting_id, "Real Meeting").unwrap();
+        insert_transcript_segment(&conn, meeting_id, 0, Some(0), 0, 1000, "hello").unwrap();
+        insert_summary(&conn, meeting_id, "a summary").unwrap();
+        insert_action_item(&conn, meeting_id, "do a thing", None, None).unwrap();
+        insert_embedding(&conn, meeting_id, "hello", &[0.1, 0.2]).unwrap();
+        let jeremiah_id = get_or_create_known_speaker(&conn, "Jeremiah").unwrap();
+        label_meeting_speaker(&conn, meeting_id, 0, Some(jeremiah_id), "Jeremiah").unwrap();
+        let seg_id = get_meeting_detail(&conn, meeting_id).unwrap().transcript[0].id;
+        set_segment_speaker_labels(&conn, &[seg_id], Some(jeremiah_id), "Jeremiah").unwrap();
+
+        clear_meeting_processing_data(&conn, meeting_id).unwrap();
+
+        let detail = get_meeting_detail(&conn, meeting_id).unwrap();
+        assert!(detail.transcript.is_empty());
+        assert_eq!(detail.summary, None);
+        assert!(detail.action_items.is_empty());
+        assert_eq!(get_meeting_speaker_labels(&conn, meeting_id).unwrap().len(), 0);
+        assert_eq!(get_segment_speaker_overrides(&conn, meeting_id).unwrap().len(), 0);
     }
 
     #[test]

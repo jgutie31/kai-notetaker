@@ -94,28 +94,25 @@ fn main() {
         return;
     }
 
-    // Reprocess mode: `cargo run --example import_legacy_recordings -- reprocess <meeting_id>`
+    // Reprocess mode: `cargo run --example import_legacy_recordings -- reprocess <meeting_id> [num_speakers]`
     // Re-runs the full pipeline (ASR/diarization/summarization) against
     // the SAME already-imported audio file, using whatever fixes have
     // landed in the pipeline code since the original import — e.g. the
     // diarization clustering threshold fix and the ASR no_context fix.
     // Clears the meeting's existing transcript/summary/action-items/
     // embeddings first so the new run doesn't append alongside stale data.
+    // Optional `num_speakers`: forces diarization to exactly that many
+    // clusters instead of guessing from a voice-similarity threshold — for
+    // a call whose real speaker count is known (see DiarizationEngine::load).
     if args.get(1).map(String::as_str) == Some("reprocess") {
-        let meeting_id: i64 = args.get(2).expect("usage: reprocess <meeting_id>").parse().expect("meeting_id must be an integer");
+        let meeting_id: i64 = args.get(2).expect("usage: reprocess <meeting_id> [num_speakers]").parse().expect("meeting_id must be an integer");
+        let num_speakers: Option<i32> = args.get(3).map(|s| s.parse().expect("num_speakers must be an integer"));
         let conn = storage::open_connection(&db_path).expect("open real encrypted db");
         let existing = storage::get_meeting_detail(&conn, meeting_id).expect("get meeting detail");
         let audio_path = existing.audio_path.expect("meeting has no audio_path to reprocess");
 
-        conn.execute("DELETE FROM transcript_segments WHERE meeting_id = ?1", [meeting_id]).unwrap();
-        conn.execute("DELETE FROM meeting_summaries WHERE meeting_id = ?1", [meeting_id]).unwrap();
-        conn.execute("DELETE FROM action_items WHERE meeting_id = ?1", [meeting_id]).unwrap();
-        conn.execute("DELETE FROM meeting_embeddings WHERE meeting_id = ?1", [meeting_id]).unwrap();
-        // Old diarization runs can assign different speaker indices than the new run —
-        // stale labels keyed on (meeting_id, speaker_index) would otherwise attach to
-        // the wrong voice after reprocessing.
-        conn.execute("DELETE FROM meeting_speaker_labels WHERE meeting_id = ?1", [meeting_id]).unwrap();
-        conn.execute("UPDATE meetings SET status = 'processing', title = NULL WHERE id = ?1", [meeting_id]).unwrap();
+        storage::clear_meeting_processing_data(&conn, meeting_id).expect("clear stale processing data");
+        storage::mark_meeting_processing(&conn, meeting_id).expect("reset meeting to processing");
 
         println!("loading engines (this takes a while — 4 real models)...");
         let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -124,6 +121,7 @@ fn main() {
             diarization: DiarizationEngine::load(
                 &manifest_dir.join("models/diarization/sherpa-onnx-pyannote-segmentation-3-0/model.onnx"),
                 &manifest_dir.join("models/diarization/speaker-embedding.onnx"),
+                num_speakers,
             )
             .expect("load diarization"),
             llm: LlmEngine::load(&manifest_dir.join("models/llm/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"), 1000)
@@ -133,10 +131,10 @@ fn main() {
             speaker_id: SpeakerIdEngine::load(&manifest_dir.join("models/diarization/speaker-embedding.onnx"))
                 .expect("load speaker id engine"),
         };
-        println!("engines loaded. reprocessing meeting_id={meeting_id} ({audio_path})...");
+        println!("engines loaded. reprocessing meeting_id={meeting_id} ({audio_path}), num_speakers={num_speakers:?}...");
 
         let audit = AuditLog::new(&audit_path);
-        match pipeline::process_meeting(&conn, &audit, &engines, meeting_id, std::path::Path::new(&audio_path)) {
+        match pipeline::process_meeting(&conn, &audit, &engines, meeting_id, std::path::Path::new(&audio_path), None) {
             Ok(()) => println!("OK: reprocessed meeting_id={meeting_id}"),
             Err(e) => eprintln!("FAILED reprocessing meeting_id={meeting_id}: {e}"),
         }
@@ -152,6 +150,7 @@ fn main() {
         diarization: DiarizationEngine::load(
             &manifest_dir.join("models/diarization/sherpa-onnx-pyannote-segmentation-3-0/model.onnx"),
             &manifest_dir.join("models/diarization/speaker-embedding.onnx"),
+            None,
         )
         .expect("load diarization"),
         llm: LlmEngine::load(&manifest_dir.join("models/llm/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"), 1000)
@@ -259,7 +258,7 @@ fn main() {
             }
         };
 
-        match pipeline::process_meeting(&conn, &audit, &engines, meeting_id, &dest) {
+        match pipeline::process_meeting(&conn, &audit, &engines, meeting_id, &dest, None) {
             Ok(()) => {
                 println!("OK: {stem} -> meeting_id={meeting_id}, duration={duration_secs}s");
                 succeeded += 1;

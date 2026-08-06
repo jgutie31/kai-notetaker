@@ -45,7 +45,16 @@ pub struct DiarizationEngine {
 }
 
 impl DiarizationEngine {
-    pub fn load(segmentation_model: &Path, embedding_model: &Path) -> Result<Self, DiarizationError> {
+    /// `num_speakers`: `None` means "unknown, cluster by voice-similarity
+    /// threshold" (the default — reasonable when nobody's told the app how
+    /// many people are on the call). `Some(n)` forces exactly `n` clusters
+    /// and ignores `threshold` entirely — verified against the real
+    /// sherpa-onnx C++ header (`fast-clustering-config.h`): "If
+    /// [num_clusters is] greater than 0, then threshold is ignored." Use
+    /// this when the real speaker count is known (e.g. a 3-person call
+    /// that a threshold-based guess split into a dozen clusters) — it's a
+    /// distinct, officially-supported clustering mode, not a hack.
+    pub fn load(segmentation_model: &Path, embedding_model: &Path, num_speakers: Option<i32>) -> Result<Self, DiarizationError> {
         let seg_path = segmentation_model
             .to_str()
             .ok_or_else(|| DiarizationError::InvalidPath(segmentation_model.display().to_string()))?
@@ -81,7 +90,7 @@ impl DiarizationEngine {
             // multi-speaker test file — "a larger threshold leads to
             // fewer clusters." 0.5 was never a reasonable production
             // value for real audio; it's just the bare struct default.
-            clustering: FastClusteringConfig { num_clusters: -1, threshold: 0.9 },
+            clustering: FastClusteringConfig { num_clusters: num_speakers.unwrap_or(-1), threshold: 0.9 },
             ..Default::default()
         };
 
@@ -165,7 +174,7 @@ mod tests {
             eprintln!("skipping: diarization models not present in this environment");
             return;
         }
-        let engine = DiarizationEngine::load(&seg, &emb).unwrap();
+        let engine = DiarizationEngine::load(&seg, &emb, None).unwrap();
         // pyannote-segmentation-3.0 is a 16kHz model — assert the engine
         // reports that rather than assuming it silently.
         assert_eq!(engine.required_sample_rate(), 16000);
@@ -183,7 +192,7 @@ mod tests {
         }
 
         let samples = crate::asr::read_wav_as_f32_mono_16k(&fixture).unwrap();
-        let engine = DiarizationEngine::load(&seg, &emb).unwrap();
+        let engine = DiarizationEngine::load(&seg, &emb, None).unwrap();
         let segments = engine.diarize(&samples).unwrap();
 
         // A single-speaker 2.6s TTS clip should produce at least one
@@ -199,6 +208,31 @@ mod tests {
             1,
             "expected exactly 1 speaker for a single-voice fixture, got {unique_speakers:?}"
         );
+    }
+
+    #[test]
+    fn known_speaker_count_forces_exactly_that_many_clusters() {
+        let seg = seg_model_path();
+        let emb = emb_model_path();
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("test-fixtures/test-speech-16k-mono.wav");
+        if !seg.exists() || !emb.exists() || !fixture.exists() {
+            eprintln!("skipping: models or fixture not present in this environment");
+            return;
+        }
+
+        let samples = crate::asr::read_wav_as_f32_mono_16k(&fixture).unwrap();
+        // Real, single-voice fixture — forcing num_speakers=1 must still
+        // report exactly 1 speaker (the known-count code path is exercised
+        // for real, not just compiled). The real multi-speaker proof (a
+        // known count fixing a real call diarization previously
+        // over-split into a dozen clusters) is verified separately against
+        // Jeremiah's actual Smithville recording, not a synthetic fixture.
+        let engine = DiarizationEngine::load(&seg, &emb, Some(1)).unwrap();
+        let segments = engine.diarize(&samples).unwrap();
+        let unique_speakers: std::collections::HashSet<i32> =
+            segments.iter().map(|s| s.speaker).collect();
+        assert_eq!(unique_speakers.len(), 1, "num_speakers=Some(1) should force exactly 1 cluster, got {unique_speakers:?}");
     }
 
     #[test]

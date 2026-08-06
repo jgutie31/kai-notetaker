@@ -84,6 +84,37 @@
   color: var(--color-danger);
 }
 
+.detail-screen__fix-speakers {
+  background: none;
+  border: none;
+  color: var(--color-accent);
+  font-size: 13px;
+  cursor: pointer;
+  padding: 0;
+  font-family: var(--font-ui);
+}
+
+.detail-screen__speaker-count {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.detail-screen__speaker-count-input {
+  width: 90px;
+  font-size: 13px;
+  padding: 2px 6px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--color-border);
+  background: var(--color-surface);
+  color: var(--color-text-primary);
+}
+
+.detail-screen__speaker-count button {
+  font-size: 12px;
+  padding: 2px 8px;
+}
+
 .detail-screen__title {
   font-family: var(--font-display);
   font-size: 26px;

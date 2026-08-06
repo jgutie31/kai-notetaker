@@ -66,6 +66,7 @@ fn spawn_engine_loading(models_dir: PathBuf, data_dir: PathBuf, engines_state: A
         let diarization = match diarization::DiarizationEngine::load(
             &models_dir.join("diarization/sherpa-onnx-pyannote-segmentation-3-0/model.onnx"),
             &models_dir.join("diarization/speaker-embedding.onnx"),
+            None,
         ) {
             Ok(e) => e,
             Err(e) => {
@@ -179,7 +180,7 @@ fn stop_recording(
             }
         };
         let audit = AuditLog::new(&audit_path);
-        if let Err(e) = pipeline::process_meeting(&conn, &audit, &engines, meeting_id, &audio_path) {
+        if let Err(e) = pipeline::process_meeting(&conn, &audit, &engines, meeting_id, &audio_path, None) {
             eprintln!("pipeline processing failed for meeting {meeting_id}: {e}");
         }
     });
@@ -189,6 +190,57 @@ fn stop_recording(
         duration_secs: elapsed,
         meeting_id,
     })
+}
+
+/// Re-runs the full pipeline for one already-processed meeting, this time
+/// telling diarization exactly how many real people were on the call
+/// instead of letting it guess from a voice-similarity threshold. Exists
+/// because threshold-based clustering can badly over-split a real call
+/// (Jeremiah's real 3-person Smithville call produced up to 12 distinct
+/// raw speaker indices) — sherpa-onnx's `num_clusters` mode forces exactly
+/// the given count and is a real, officially-supported clustering mode,
+/// not a guess-and-check workaround.
+#[tauri::command]
+fn reprocess_meeting_with_speaker_count(
+    meeting_id: i64,
+    num_speakers: i32,
+    paths: State<AppPaths>,
+    engines: State<EnginesState>,
+) -> Result<(), String> {
+    let db_path = paths.data_dir.join("kai-notetaker.sqlite3");
+    let conn = storage::open_connection(&db_path).map_err(|e| e.to_string())?;
+    let detail = storage::get_meeting_detail(&conn, meeting_id).map_err(|e| e.to_string())?;
+    let audio_path = detail.audio_path.ok_or("this meeting has no audio to reprocess")?;
+
+    let models_dir = model_provisioning::resolve_models_dir(&paths.data_dir);
+    let fresh_diarization = diarization::DiarizationEngine::load(
+        &models_dir.join("diarization/sherpa-onnx-pyannote-segmentation-3-0/model.onnx"),
+        &models_dir.join("diarization/speaker-embedding.onnx"),
+        Some(num_speakers),
+    )
+    .map_err(|e| e.to_string())?;
+
+    storage::clear_meeting_processing_data(&conn, meeting_id).map_err(|e| e.to_string())?;
+    storage::mark_meeting_processing(&conn, meeting_id).map_err(|e| e.to_string())?;
+
+    let engines_arc = engines.0.lock().map_err(|_| "engines lock poisoned".to_string())?.clone().ok_or("models are still loading — try again shortly")?;
+    let db_path = db_path.clone();
+    let audit_path = paths.data_dir.join("audit-log.jsonl");
+    std::thread::spawn(move || {
+        let conn = match storage::open_connection(&db_path) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("reprocess: failed to open db for meeting {meeting_id}: {e}");
+                return;
+            }
+        };
+        let audit = AuditLog::new(&audit_path);
+        if let Err(e) = pipeline::process_meeting(&conn, &audit, &engines_arc, meeting_id, std::path::Path::new(&audio_path), Some(&fresh_diarization)) {
+            eprintln!("reprocess with known speaker count failed for meeting {meeting_id}: {e}");
+        }
+    });
+
+    Ok(())
 }
 
 #[tauri::command]
@@ -383,7 +435,8 @@ pub fn run() {
             delete_meeting,
             undelete_meeting,
             list_known_speakers,
-            label_transcript_segments
+            label_transcript_segments,
+            reprocess_meeting_with_speaker_count
         ])
         .setup(|app| {
             let data_dir = app

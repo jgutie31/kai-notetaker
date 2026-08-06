@@ -81,12 +81,20 @@ export function MeetingDetail({ meetingId, onBack, onDelete }: MeetingDetailProp
   const [rememberSpeaker, setRememberSpeaker] = useState(true);
   const [applyToWholeSpeaker, setApplyToWholeSpeaker] = useState(false);
   const [labelingInFlight, setLabelingInFlight] = useState(false);
+  const [showSpeakerCountInput, setShowSpeakerCountInput] = useState(false);
+  const [speakerCountDraft, setSpeakerCountDraft] = useState("");
+  const [reprocessing, setReprocessing] = useState(false);
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const segmentRefs = useRef<(HTMLDivElement | null)[]>([]);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const topRef = useRef<HTMLDivElement | null>(null);
   const resizerRef = useRef<HTMLDivElement | null>(null);
+
+  // Bumped after triggering a reprocess so the polling effect below
+  // restarts even though it already stopped once this meeting reached
+  // "ready" the first time around.
+  const [pollGeneration, setPollGeneration] = useState(0);
 
   useEffect(() => {
     let cancelled = false;
@@ -111,7 +119,7 @@ export function MeetingDetail({ meetingId, onBack, onDelete }: MeetingDetailProp
       cancelled = true;
       if (interval) clearInterval(interval);
     };
-  }, [meetingId]);
+  }, [meetingId, pollGeneration]);
 
   useEffect(() => {
     invoke<string[]>("list_known_speakers").then(setKnownSpeakers).catch(() => {});
@@ -159,6 +167,24 @@ export function MeetingDetail({ meetingId, onBack, onDelete }: MeetingDetailProp
         onBack();
       })
       .catch((e) => setError(String(e)));
+  };
+
+  const handleReprocessWithSpeakerCount = () => {
+    if (!detail) return;
+    const numSpeakers = parseInt(speakerCountDraft, 10);
+    if (!Number.isInteger(numSpeakers) || numSpeakers < 1) {
+      setError("Enter how many real people were on this call (1 or more).");
+      return;
+    }
+    setReprocessing(true);
+    invoke("reprocess_meeting_with_speaker_count", { meetingId: detail.id, numSpeakers })
+      .then(() => {
+        setDetail((prev) => (prev ? { ...prev, status: "processing", transcript: [], summary: null, action_items: [] } : prev));
+        setPollGeneration((g) => g + 1);
+        setShowSpeakerCountInput(false);
+      })
+      .catch((e) => setError(String(e)))
+      .finally(() => setReprocessing(false));
   };
 
   // Plain click selects just this one line. Shift+click while a selection
@@ -297,6 +323,45 @@ export function MeetingDetail({ meetingId, onBack, onDelete }: MeetingDetailProp
           <button type="button" className="detail-screen__back" onClick={onBack}>
             ← Back to meetings
           </button>
+          {detail && detail.status !== "processing" && (
+            <>
+              {showSpeakerCountInput ? (
+                <span className="detail-screen__speaker-count">
+                  <input
+                    type="number"
+                    min={1}
+                    autoFocus
+                    placeholder="# of people"
+                    className="detail-screen__speaker-count-input"
+                    value={speakerCountDraft}
+                    onChange={(e) => setSpeakerCountDraft(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") handleReprocessWithSpeakerCount();
+                      if (e.key === "Escape") setShowSpeakerCountInput(false);
+                    }}
+                  />
+                  <button type="button" disabled={reprocessing} onClick={handleReprocessWithSpeakerCount}>
+                    Reprocess
+                  </button>
+                  <button type="button" onClick={() => setShowSpeakerCountInput(false)}>
+                    Cancel
+                  </button>
+                </span>
+              ) : (
+                <button
+                  type="button"
+                  className="detail-screen__fix-speakers"
+                  title="Tell the app exactly how many real people were on this call, instead of it guessing from voice similarity"
+                  onClick={() => {
+                    setSpeakerCountDraft("");
+                    setShowSpeakerCountInput(true);
+                  }}
+                >
+                  Fix speaker count
+                </button>
+              )}
+            </>
+          )}
           {detail && (
             <button type="button" className="detail-screen__delete" onClick={handleDeleteClick}>
               Delete
