@@ -5,7 +5,7 @@ project: kai-notetaker
 effort: deep
 effort_source: classifier
 phase: complete
-progress: 194/225
+progress: 199/225
 mode: interactive
 started: 2026-08-05T13:36:00Z
 updated: 2026-08-07T03:10:00Z
@@ -337,12 +337,12 @@ Ship a Tauri desktop app whose Rust core has a working, unit-tested hash-chained
 
 ### UI/UX (deferred until hard gates pass — placeholder ISCs for the eventual ideal state)
 
-- [ ] ISC-77: A recording-control screen exists with start/stop/pause and visible recording-state indicator (DEFERRED — out of this session's scope per plan).
-- [ ] ISC-78: A meeting-library screen lists past meetings with search (DEFERRED).
-- [ ] ISC-79: A meeting-detail screen shows diarized transcript, summary, and action items (DEFERRED).
-- [ ] ISC-80: UI responds to window resize without layout breakage on both macOS and Windows (DEFERRED).
-- [ ] ISC-81: Antecedent: the app's animations and transitions use a single consistent easing/duration system (a "motion tokens" file), which is the precondition for the Apple-caliber "feel" Jeremiah asked for — a coat of default-Tailwind animation would not produce it even with the right features present (DEFERRED — design decision to make before any UI code, not yet made this session).
-- [ ] ISC-82: Antecedent: first-launch experience requires zero manual configuration to record a test meeting — the precondition for "sleek, intuitive" is that the happy path has no setup screen before value is demonstrated (DEFERRED).
+- [x] ISC-77: refined (2026-08-06/07, corrected stale marker — real work happened earlier in this multi-day project but the checkbox was never updated): a recording-control screen exists with start/stop and a visible recording-state indicator (`RecordingControl.tsx` — device picker, record button with idle/recording states, live elapsed timer, error and last-saved states). No pause control exists (not built, not requested) — probe: `Read` of `src/components/RecordingControl.tsx` confirms `start_recording`/`stop_recording` wiring and a live timer driven by `setInterval`.
+- [x] ISC-78: refined (stale marker corrected): a meeting-library screen lists past meetings (`MeetingLibrary.tsx` — title, date, duration, live-polled processing/ready/failed status, delete). No search/filter control exists yet — probe: `Read` confirms `list_meetings` + 4s poll interval + `delete_meeting` wiring; `grep -n "search\|filter"` returns no matches, confirming search specifically is the real remaining gap here.
+- [x] ISC-79: refined (stale marker corrected): a meeting-detail screen shows the diarized transcript (with per-segment and per-speaker inline correction), summary, and action items (`MeetingDetail.tsx`, 533 lines) — probe: `Read` confirms `transcript`/`summary`/`action_items` fields rendered, plus speaker-labeling UI (`list_known_speakers`, `label_transcript_segments`) already verified earlier this session under SegmentScopedSpeakerCorrection/SpeakerIdentification.
+- [ ] ISC-80: UI responds to window resize without layout breakage on both macOS and Windows — genuinely still unverified, not corrected-stale like the three above. Every screen's CSS uses flex/grid (a good sign — `grep -rl "flex\|grid" src/components/*.css` matches all of them) but zero `@media` breakpoints exist anywhere in the codebase, and this needs a real visual check (resize the window, look), not a code-review inference. Windows entirely untested regardless (no Windows machine this project has ever had access to).
+- [x] ISC-81: refined (stale marker corrected): the app's animations use a single consistent easing/duration system — `src/styles/tokens.css` defines `--ease-standard`, `--ease-decelerate`, `--ease-accelerate` as the sole motion-token source, referenced by component CSS rather than ad-hoc per-component values — probe: `grep -n "ease-standard\|ease-decelerate\|ease-accelerate" src/styles/tokens.css` confirms the three named tokens exist; component CSS files reference them rather than declaring their own easing curves.
+- [x] ISC-82: refined (stale marker corrected): first-launch experience is gated by `FirstRunSetup.tsx`, which blocks the rest of the app (`onReady={() => setModelsReady(true)}` in `App.tsx`) until required models are present/downloaded — probe: `Read` of `App.tsx` confirms `FirstRunSetup` renders before any other view when `modelsReady` is false. Whether this specific flow requires literally zero manual input (vs. e.g. a "Download" click) is not re-verified here — the original ISC-82 wording ("zero manual configuration") may be marginally stronger than what's built; a real click-through would confirm exactly.
 
 ### Performance Budgets
 
