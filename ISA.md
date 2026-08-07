@@ -4,8 +4,8 @@ slug: 20260805-083600_kai-notetaker
 project: kai-notetaker
 effort: deep
 effort_source: classifier
-phase: complete
-progress: 220/246
+phase: build
+progress: 220/257
 mode: interactive
 started: 2026-08-05T13:36:00Z
 updated: 2026-08-07T03:10:00Z
@@ -363,6 +363,20 @@ Ship a Tauri desktop app whose Rust core has a working, unit-tested hash-chained
 - [x] ISC-243: Anti: the overlay never appears when nothing is recording — it starts hidden and only shows for the duration of an active recording, regardless of trigger (probe: a fresh app launch with no recording shows no overlay; a test/manual check confirms it appears within one state-check cycle of any of the three start triggers and disappears within one cycle of any stop trigger).
 - [x] ISC-244: `cargo test --lib` passes 100% and `bunx tsc --noEmit` exits 0 after RecordingIndicatorOverlay lands, with zero regressions in the pre-existing suite (baseline going in: 151 passed, plus whatever TeamsPresenceAdhocRecording adds).
 
+### RecordingTriggerProvenance — Records HOW each meeting was captured (2026-08-07, Jeremiah's explicit request: "have the way it was recorded listed... so as not to confuse or just be certain of how it was recorded for analysis moving forward")
+
+- [ ] ISC-245: A new `trigger_source` column is added to the `meetings` table via the existing `apply_column_migrations` pattern (`ALTER TABLE meetings ADD COLUMN trigger_source TEXT` — nullable, so pre-existing rows from before this feature are not broken by a `NOT NULL` constraint they can't satisfy retroactively) — probe: `grep -n "trigger_source" storage.rs` shows the migration; a test opens a DB created before this migration existed (or simulates one) and confirms `ensure_schema` adds the column without erroring on existing rows.
+- [ ] ISC-246: `storage::create_meeting` takes an explicit trigger-source value rather than defaulting silently — every caller must state how the recording it's persisting actually started (probe: `grep -n "fn create_meeting"` shows the new parameter; `cargo build` fails if any caller omits it, since there is no default argument in Rust).
+- [ ] ISC-247: The real, distinct trigger values are: `manual` (the Start Recording button), `calendar` (AutoJoinRecording, any of the three providers), `presence` (TeamsPresenceAdhocRecording), and `recovered` (crash-orphan recovery, ISC-217-221) — `recovered` is deliberately its own honest value, not a guess at which of the other three it originally was, since that information did not survive the crash (probe: an enum, not a bare `String`, so an invalid/typo'd value is a compile error, not a silent bad row — e.g. `pub enum TriggerSource { Manual, Calendar, Presence, Recovered }` with a `Display`/`FromStr` or serde mapping to the exact four lowercase strings above).
+- [ ] ISC-248: `start_recording`'s Tauri command gains a way to know its own trigger source and thread it through to the eventual `create_meeting` call at stop time — since a recording's trigger is only known at START but `create_meeting` only runs at STOP, the value must be carried in `RecordingState` itself (extending the existing `Mutex<Option<(RecordingSession, Instant)>>` tuple with a third element, or an equivalent small struct) for the whole lifetime of the in-progress recording (probe: `Read` of `RecordingState`'s definition confirms the extended shape; `stop_recording` reads the stored trigger source, does not re-derive or guess it).
+- [ ] ISC-249: The manually-clicked Start Recording button continues to work with zero frontend changes — `RecordingControl.tsx`'s existing `invoke("start_recording")` call (no arguments) must still compile and behave identically, defaulting to `TriggerSource::Manual` when the trigger argument is omitted (probe: `Read` of `RecordingControl.tsx` shows no diff was needed; `bunx tsc --noEmit` exit 0).
+- [ ] ISC-250: The three internal (non-IPC) callers of `start_recording` — the calendar-triggered auto-start (`run_auto_join_cycle`), the presence-triggered auto-start (`run_presence_cycle`), and any future trigger — explicitly pass `TriggerSource::Calendar`/`TriggerSource::Presence` respectively; no internal caller is allowed to fall back to the `Manual` default (probe: `grep -n "start_recording("` at each of the three call sites confirms an explicit, non-default trigger argument at the two auto-trigger sites).
+- [ ] ISC-251: The startup orphan-recovery path (`recover_orphan_into_db`) passes `TriggerSource::Recovered` to `create_meeting` — not a guess, not the default (probe: `grep` confirms the literal `Recovered` value at that specific call site).
+- [ ] ISC-252: `get_meeting_detail` (or whichever query backs `MeetingDetail.tsx`) returns the meeting's `trigger_source` as part of its response payload, and `MeetingDetail.tsx` displays it as a small, clearly-labeled indicator near the meeting's title (e.g. "Recorded: Manual" / "Recorded: Calendar (auto-join)" / "Recorded: Ad-hoc Teams call" / "Recorded: Recovered after a crash") — so Jeremiah can look at any past meeting and know with certainty how it was captured, without needing to cross-reference logs (probe: `Read` of `MeetingDetail.tsx` confirms the field is rendered; `bunx tsc --noEmit` exit 0).
+- [ ] ISC-253: `MeetingLibrary.tsx`'s list view also shows a compact per-row indicator of trigger source (e.g. a small icon or short tag next to the existing status badge) — the same certainty at a glance while browsing, not only after opening a specific meeting (probe: `Read` confirms the field is rendered in the list row).
+- [ ] ISC-254: Anti: the trigger-source label is displayed as UI metadata alongside the title/summary — it is NOT injected into the LLM-generated summary text itself. Baking provenance into model-generated prose would make it fragile (dependent on the summarization prompt/model behavior) and would mix operational metadata into content meant for a different purpose (probe: `grep -n "trigger_source\|TriggerSource"` in `summarization.rs`/`llm.rs`/wherever the summarization prompt is built returns zero matches — the summarization pipeline is untouched by this feature).
+- [ ] ISC-255: `cargo test --lib` passes 100% and `bunx tsc --noEmit` exits 0 after RecordingTriggerProvenance lands, with zero regressions in the pre-existing suite (baseline going in: 171 passed).
+
 ### UI/UX (deferred until hard gates pass — placeholder ISCs for the eventual ideal state)
 
 - [x] ISC-77: refined (2026-08-06/07, corrected stale marker — real work happened earlier in this multi-day project but the checkbox was never updated): a recording-control screen exists with start/stop and a visible recording-state indicator (`RecordingControl.tsx` — device picker, record button with idle/recording states, live elapsed timer, error and last-saved states). No pause control exists (not built, not requested) — probe: `Read` of `src/components/RecordingControl.tsx` confirms `start_recording`/`stop_recording` wiring and a live timer driven by `setInterval`.
@@ -646,6 +660,36 @@ Ship a Tauri desktop app whose Rust core has a working, unit-tested hash-chained
   check: cargo test --lib exit code and pass count; bunx tsc --noEmit exit code
   threshold: exit 0 both; passed >= (151 + TeamsPresenceAdhocRecording's new tests), 0 failed
   tool: cargo test --lib && bunx tsc --noEmit
+
+- isc: ISC-245
+  type: integration-test
+  check: ensure_schema adds trigger_source to a pre-migration DB without erroring on existing rows
+  threshold: column present after migration, pre-existing rows unaffected
+  tool: cargo test storage::tests (migration-on-existing-DB fixture)
+
+- isc: ISC-246/247
+  type: build-probe
+  check: create_meeting's new parameter is a required, typed enum argument
+  threshold: cargo build fails if any call site omits it or passes an invalid value
+  tool: cargo build (compile-time enforcement)
+
+- isc: ISC-250/251
+  type: unit-test
+  check: each trigger call site passes its own correct, explicit TriggerSource
+  threshold: calendar site -> Calendar, presence site -> Presence, orphan-recovery -> Recovered, manual default -> Manual
+  tool: grep -n "start_recording(\|create_meeting(" (call-site audit) + cargo test --lib
+
+- isc: ISC-254
+  type: static-check
+  check: no trigger_source/TriggerSource reference in the summarization pipeline
+  threshold: 0 matches
+  tool: grep -rn "trigger_source\|TriggerSource" src-tauri/src/summarization.rs src-tauri/src/llm.rs
+
+- isc: ISC-255
+  type: build-probe
+  check: cargo test --lib exit code and pass count; bunx tsc --noEmit exit code
+  threshold: exit 0 both; passed >= 171 + new tests, 0 failed
+  tool: cargo test --lib && bunx tsc --noEmit
 ```
 
 ## Features
@@ -818,6 +862,12 @@ Ship a Tauri desktop app whose Rust core has a working, unit-tested hash-chained
   satisfies: [ISC-238, ISC-239, ISC-240, ISC-241, ISC-242, ISC-243, ISC-244]
   depends_on: [AudioCapture, TeamsPresenceAdhocRecording]
   parallelizable: false
+
+- name: RecordingTriggerProvenance
+  description: Persists and surfaces HOW each meeting was captured (manual/calendar/presence/recovered) so past recordings are unambiguous for later analysis
+  satisfies: [ISC-245, ISC-246, ISC-247, ISC-248, ISC-249, ISC-250, ISC-251, ISC-252, ISC-253, ISC-254, ISC-255]
+  depends_on: [StorageLayer, AutoJoinRecording, TeamsPresenceAdhocRecording]
+  parallelizable: false
 ```
 
 ## Decisions
@@ -893,6 +943,7 @@ Ship a Tauri desktop app whose Rust core has a working, unit-tested hash-chained
 - 2026-08-07 (Engineer delivered TeamsPresenceAdhocRecording + RecordingIndicatorOverlay — 171/171 tests, independently re-verified by Kai): read the actual diff (`presence.rs`, `RecordingBadge.tsx`/`.css`, `lib.rs`, `auto_join.rs`, `calendar.rs`, `capabilities/default.json`, `main.tsx`, `RecordingControl.tsx`, `CalendarSettings.tsx`) rather than trusting the self-report alone. `AutoStopTrigger` was placed in `auto_join.rs` rather than `lib.rs` as originally spec'd — a real, disclosed, correct deviation: both `auto_join` and `presence` reason about it in pure/tested code, and neither should reach into the Tauri-bound crate root to do so. Two real bugs found and fixed by Engineer during its own build, neither catchable by the test suite: (1) `capabilities/default.json` scoped `invoke()` to `"windows": ["main"]` only, which would have made the overlay render and then freeze at `00:00` forever — every command call from the badge window would have been silently denied by Tauri's own runtime permission system, a class of bug no Rust or TypeScript test exercises. (2) A hardcoded overlay position would have misplaced the badge off-screen on any display narrower than the one it was tuned for — fixed with a pure, unit-tested function computed from the real primary-monitor size instead. Caught Kai's own bulk-edit mistake immediately after: a Python script marking ISC-224 through ISC-244 done incorrectly included ISC-227, which explicitly requires Jeremiah's own live Meet Now test and had not happened — corrected back to `[DEFERRED-VERIFY]` before this entry was written, not after.
 - 2026-08-07 (real open design question, disclosed by Engineer, not silently resolved either way): the presence poller gates only on Microsoft being connected — it does NOT check the `auto_join_enabled` toggle (labeled "Auto-join & record calendar meetings" in the UI, explicitly calendar-scoped in its own wording). This means unticking that toggle stops calendar-triggered auto-recording but leaves ad-hoc Teams-call detection running. Defensible as shipped (the toggle's own label is calendar-specific; Jeremiah asked for presence detection as an explicitly separate capability the same session, already accepting silent operation for it specifically, conditioned on the now-built overlay indicator) — but plausibly not what a user would assume "auto-join" means if read as "all auto-recording." Flagged to Jeremiah directly rather than picked silently; a future separate toggle for presence-based detection is the clean fix if he wants independent control, deferred pending his real-world read of the current behavior during first live test.
 - 2026-08-07 (real regression, root-caused and fixed same-session — a CSS global-scope leak broke the main window's theme): Jeremiah reported the main app's background had gone all-white with illegible tabs immediately after this round's build. Root cause: `RecordingBadge.css` styled the overlay window with a bare `html, body, #root { background: transparent; ... }` selector — since both Tauri windows load the identical compiled CSS bundle (confirmed in `main.tsx`'s own doc comment), this unscoped rule matched inside the MAIN window's document too, silently overriding `tokens.css`'s real theme background (`body { background: var(--color-bg); ... }`) with `transparent`, which rendered as a blank/white fallback behind light-on-dark theme text. Fixed by scoping the override to `html.recording-badge-window` and adding/removing that class on `<html>` from within `RecordingBadge.tsx`'s own mount effect — since each Tauri window is a genuinely separate `document` (not a shared DOM), a class set only inside the badge window's own React tree can never leak into the main window's document, closing the leak at its actual source rather than just patching the symptom. Verified via Vite HMR log (`hmr update /src/components/RecordingBadge.tsx` then `.css`) and a fresh `cargo test --lib` (171/171 unaffected — this was a pure frontend CSS-scoping bug, no backend logic involved).
+- 2026-08-07 (Jeremiah's direct response to the auto-join-toggle scope question, driving both a quick text fix and RecordingTriggerProvenance): rather than change the toggle's actual behavior, Jeremiah asked to keep it as-is but make its real boundary explicit in its own hint text (fixed directly, `CalendarSettings.tsx`'s auto-join hint now states plainly that it only governs scheduled meetings and that ad-hoc Teams detection runs regardless). He also asked for something more durable than UI copy: a permanent, per-meeting record of HOW each recording was triggered, so a past meeting's capture method is never ambiguous "for analysis moving forward." Interpretation adopted (stated here so it can be corrected if wrong): the trigger source is displayed as UI metadata next to the title/summary in `MeetingDetail.tsx` (and a compact indicator in `MeetingLibrary.tsx`'s list), NOT injected into the LLM-generated summary text itself — baking it into model-generated prose would make the signal fragile (dependent on the summarization prompt/model rather than a real, structured DB field) and would blur operational metadata into content meant for a different purpose. A distinct `Recovered` value (not a guess at which of Manual/Calendar/Presence a crash-orphaned recording originally was) is used for orphan-recovered meetings, since that information genuinely did not survive the crash — honest uncertainty, not a fabricated best-guess.
 
 ## Changelog
 

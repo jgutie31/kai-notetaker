@@ -230,10 +230,18 @@ export function CalendarSettings() {
               <span>Auto-join &amp; record calendar meetings</span>
             </label>
             <p className="calendar-settings__hint">
-              When a meeting with a Teams, Google Meet, or Zoom join link is about to start, its link opens and
-              recording begins automatically, across every provider connected above. Recording stops on its own at
-              the meeting's scheduled end time, and you'll be asked whether to stop if the call goes quiet for a
-              minute. Off by default; turning it off takes effect within a minute.
+              This controls <strong>scheduled</strong> meetings only: when a calendar meeting with a Teams, Google
+              Meet, or Zoom join link is about to start, its link opens and recording begins automatically, across
+              every provider connected above. Recording stops on its own at the meeting's scheduled end time, and
+              you'll be asked whether to stop if the call goes quiet for a minute. Off by default; turning it off
+              takes effect within a minute.
+            </p>
+            <p className="calendar-settings__hint">
+              <strong>This toggle does not control ad-hoc calls.</strong> If Microsoft is connected with presence
+              access enabled, starting an unscheduled Teams call (e.g. clicking "Meet Now") is detected and recorded
+              automatically regardless of this setting — there's no calendar event for this toggle to gate. A small
+              on-screen indicator always shows while any recording is active, so you can tell at a glance whether one
+              is running.
             </p>
 
             {autoJoined.length > 0 && (
