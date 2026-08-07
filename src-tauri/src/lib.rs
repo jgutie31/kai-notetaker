@@ -39,7 +39,22 @@ use tauri::{Manager, State};
 /// crate's own compile-time assertion, so this is sound to hold in
 /// Tauri's managed state without any unsafe wrapper.
 #[derive(Default)]
-struct RecordingState(Mutex<Option<(audio_capture::RecordingSession, Instant)>>);
+struct RecordingState(Mutex<Option<ActiveRecording>>);
+
+/// Everything that must survive from START to STOP for one recording.
+///
+/// Was a bare `(RecordingSession, Instant)` tuple; now a named struct
+/// because ISC-248 adds a third member whose position in a tuple would
+/// mean nothing at the call sites. The trigger source is the reason:
+/// a recording's trigger is only knowable at START, but `create_meeting`
+/// only runs at STOP, so the value has to ride along here for the
+/// recording's whole lifetime rather than being re-derived (guessed)
+/// later from whatever state happens to still be around.
+struct ActiveRecording {
+    session: audio_capture::RecordingSession,
+    started_at: Instant,
+    trigger_source: storage::TriggerSource,
+}
 
 /// Tracks the meeting AutoJoinRecording is currently capturing, if any —
 /// distinct from `RecordingState` itself so auto-stop only ever ends a
@@ -204,8 +219,23 @@ fn set_recording_badge_visible(app: &tauri::AppHandle, visible: bool) {
     }
 }
 
+/// `trigger_source` is an optional IPC argument specifically so the
+/// frontend's existing `invoke("start_recording")` — which passes no
+/// arguments at all — keeps working untouched (ISC-249). Verified against
+/// tauri 2.11.5's `CommandItem::deserialize_option`: a key missing from
+/// the JSON payload visits `none`, so an omitted argument really does
+/// arrive as `None` rather than an "invalid args" rejection.
+///
+/// `None` therefore means exactly one thing — a human clicked the button.
+/// The internal auto-trigger callers always pass their own value and are
+/// never allowed to reach this default (ISC-250).
 #[tauri::command]
-fn start_recording(app: tauri::AppHandle, state: State<RecordingState>) -> Result<(), String> {
+fn start_recording(
+    app: tauri::AppHandle,
+    state: State<RecordingState>,
+    trigger_source: Option<storage::TriggerSource>,
+) -> Result<(), String> {
+    let trigger_source = trigger_source.unwrap_or(storage::TriggerSource::Manual);
     let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
     let recording_id = chrono::Utc::now().format("%Y%m%dT%H%M%S").to_string();
 
@@ -216,7 +246,7 @@ fn start_recording(app: tauri::AppHandle, state: State<RecordingState>) -> Resul
     if guard.is_some() {
         return Err("a recording is already in progress".to_string());
     }
-    *guard = Some((session, Instant::now()));
+    *guard = Some(ActiveRecording { session, started_at: Instant::now(), trigger_source });
 
     // Only after the capture is genuinely live and committed to state — the
     // badge must never claim a recording that an early return above
@@ -228,8 +258,8 @@ fn start_recording(app: tauri::AppHandle, state: State<RecordingState>) -> Resul
 #[tauri::command]
 fn switch_recording_device(device_name: String, state: State<RecordingState>) -> Result<(), String> {
     let mut guard = state.0.lock().map_err(|_| "recording state lock poisoned")?;
-    let (session, _) = guard.as_mut().ok_or("no recording in progress")?;
-    session.switch_device(&device_name).map_err(|e| e.to_string())
+    let active = guard.as_mut().ok_or("no recording in progress")?;
+    active.session.switch_device(&device_name).map_err(|e| e.to_string())
 }
 
 #[derive(serde::Serialize)]
@@ -255,8 +285,8 @@ struct RecordingStatusPayload {
 #[tauri::command]
 fn recording_status(state: State<RecordingState>) -> Option<RecordingStatusPayload> {
     let guard = state.0.lock().ok()?;
-    let (_, started_at) = guard.as_ref()?;
-    Some(RecordingStatusPayload { elapsed_secs: started_at.elapsed().as_secs() })
+    let active = guard.as_ref()?;
+    Some(RecordingStatusPayload { elapsed_secs: active.started_at.elapsed().as_secs() })
 }
 
 #[tauri::command]
@@ -268,7 +298,8 @@ fn stop_recording(
     auto_recording_state: State<AutoRecordingState>,
 ) -> Result<StopRecordingResult, String> {
     let mut guard = state.0.lock().map_err(|_| "recording state lock poisoned")?;
-    let (session, started_at) = guard.take().ok_or("no recording in progress")?;
+    let ActiveRecording { session, started_at, trigger_source } =
+        guard.take().ok_or("no recording in progress")?;
     let elapsed = started_at.elapsed().as_secs();
     let path = session.stop_and_write().map_err(|e| e.to_string())?;
 
@@ -288,7 +319,11 @@ fn stop_recording(
     let audit_path = paths.data_dir.join("audit-log.jsonl");
     let conn = storage::open_connection(&db_path).map_err(|e| e.to_string())?;
     storage::ensure_schema(&conn).map_err(|e| e.to_string())?;
-    let meeting_id = storage::create_meeting(&conn, &path.display().to_string(), elapsed).map_err(|e| e.to_string())?;
+    // ISC-248: read back out of the recording's own state, never
+    // re-derived here — by stop time the calendar/presence context that
+    // started this recording may well be gone.
+    let meeting_id = storage::create_meeting(&conn, &path.display().to_string(), elapsed, trigger_source)
+        .map_err(|e| e.to_string())?;
 
     // Heavy CPU/GPU-bound work — a real OS thread, not an async task, so
     // it never blocks Tokio's worker pool or the UI thread. Waits for
@@ -614,8 +649,15 @@ fn run_auto_join_cycle(app: &tauri::AppHandle, db_path: &std::path::Path) {
             // The exact same command function the Start Recording button
             // calls — not a parallel recording path — so an auto-started
             // meeting produces an identical on-disk artifact and runs the
-            // identical downstream pipeline (ISC-171).
-            if let Err(e) = start_recording(app.clone(), app.state::<RecordingState>()) {
+            // identical downstream pipeline (ISC-171). The one thing that
+            // differs is what gets recorded ABOUT the recording: this site
+            // states its own trigger explicitly (ISC-250) and never falls
+            // through to the Manual default.
+            if let Err(e) = start_recording(
+                app.clone(),
+                app.state::<RecordingState>(),
+                Some(storage::TriggerSource::Calendar),
+            ) {
                 eprintln!("auto-join: failed to start recording for '{}': {e}", meeting.subject);
             } else {
                 println!("auto-join: started recording for '{}'", meeting.subject);
@@ -711,8 +753,13 @@ fn run_presence_cycle(app: &tauri::AppHandle) {
         // ISC-231: the exact same command function the Start Recording
         // button and the calendar poller call — not a parallel recording
         // path — so an ad-hoc capture produces an identical on-disk artifact
-        // and runs the identical downstream pipeline.
-        match start_recording(app.clone(), app.state::<RecordingState>()) {
+        // and runs the identical downstream pipeline. Explicit trigger
+        // (ISC-250) — an ad-hoc capture must never be filed as Manual.
+        match start_recording(
+            app.clone(),
+            app.state::<RecordingState>(),
+            Some(storage::TriggerSource::Presence),
+        ) {
             Ok(()) => {
                 println!("presence: detected an ad-hoc Teams call — started recording");
                 if let Ok(mut marker_guard) = app.state::<AutoRecordingState>().0.lock() {
@@ -794,7 +841,7 @@ fn silence_monitor_tick(
         match app.state::<RecordingState>().0.lock() {
             Ok(guard) => guard
                 .as_ref()
-                .map(|(session, _)| session.trailing_rms(silence_monitor::SILENCE_WINDOW_SECS)),
+                .map(|active| active.session.trailing_rms(silence_monitor::SILENCE_WINDOW_SECS)),
             Err(_) => return,
         }
     };
@@ -1192,8 +1239,16 @@ fn recover_orphan_into_db(
     if duration_secs == 0 {
         return Ok(None);
     }
-    let meeting_id = storage::create_meeting(conn, &path.display().to_string(), duration_secs)
-        .map_err(|e| e.to_string())?;
+    // ISC-251: hardcoded `Recovered`, not derived from anything. Whatever
+    // originally triggered this recording died with the process — saying
+    // "recovered" is the only claim we can actually stand behind.
+    let meeting_id = storage::create_meeting(
+        conn,
+        &path.display().to_string(),
+        duration_secs,
+        storage::TriggerSource::Recovered,
+    )
+    .map_err(|e| e.to_string())?;
     Ok(Some(meeting_id))
 }
 
@@ -1664,7 +1719,13 @@ mod orphan_recovery_tests {
 
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         storage::ensure_schema(&conn).unwrap();
-        storage::create_meeting(&conn, &existing.display().to_string(), 2).unwrap();
+        storage::create_meeting(
+            &conn,
+            &existing.display().to_string(),
+            2,
+            storage::TriggerSource::Manual,
+        )
+        .unwrap();
 
         // Three "restarts" — each one must find nothing.
         for restart in 1..=3 {

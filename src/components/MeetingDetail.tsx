@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
+import { TriggerSource, triggerSourceDetailLabel, triggerSourceIcon } from "../lib/triggerSource";
 import "./MeetingDetail.css";
 
 interface TranscriptSegmentRow {
@@ -28,6 +29,8 @@ interface MeetingDetailData {
   transcript: TranscriptSegmentRow[];
   action_items: ActionItemRow[];
   audio_path: string | null;
+  /** null for meetings recorded before trigger provenance was tracked. */
+  trigger_source: TriggerSource | null;
 }
 
 function formatTimestamp(ms: number): string {
@@ -398,6 +401,21 @@ export function MeetingDetail({ meetingId, onBack, onDelete }: MeetingDetailProp
             <div className="detail-screen__meta">
               {Math.floor(detail.duration_secs / 60)}:{(detail.duration_secs % 60).toString().padStart(2, "0")}
             </div>
+
+            {/* ISC-252: how this meeting was captured, as UI metadata next
+                to the title — deliberately NOT part of the generated
+                summary text. Rendered only when a real value exists;
+                pre-provenance meetings show nothing rather than a
+                misleading default. */}
+            {triggerSourceDetailLabel(detail.trigger_source) && (
+              <div
+                className={`detail-screen__trigger detail-screen__trigger--${detail.trigger_source}`}
+                title="How this recording was started"
+              >
+                <span aria-hidden="true">{triggerSourceIcon(detail.trigger_source)}</span> Recorded:{" "}
+                {triggerSourceDetailLabel(detail.trigger_source)}
+              </div>
+            )}
 
             {detail.audio_path && (
               <audio

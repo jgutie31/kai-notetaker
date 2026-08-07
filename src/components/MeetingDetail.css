@@ -311,3 +311,22 @@
 .detail-screen__failed {
   color: var(--color-danger);
 }
+
+/* ISC-252: how this meeting was captured, shown as metadata directly
+   under the title/duration. Never injected into the generated summary. */
+.detail-screen__trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--color-text-secondary);
+  background: rgba(120, 120, 128, 0.12);
+  padding: 3px var(--space-3);
+  border-radius: var(--radius-full);
+  margin-bottom: var(--space-4);
+}
+
+.detail-screen__trigger--recovered {
+  background: rgba(253, 166, 38, 0.16);
+  color: #b5791c;
+}

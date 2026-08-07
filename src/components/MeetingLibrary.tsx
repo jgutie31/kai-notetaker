@@ -1,5 +1,11 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import {
+  TriggerSource,
+  triggerSourceDetailLabel,
+  triggerSourceIcon,
+  triggerSourceShortLabel,
+} from "../lib/triggerSource";
 import "./MeetingLibrary.css";
 
 interface MeetingListItem {
@@ -8,6 +14,8 @@ interface MeetingListItem {
   title: string | null;
   duration_secs: number;
   status: "processing" | "ready" | "failed" | string;
+  /** null for meetings recorded before trigger provenance was tracked. */
+  trigger_source: TriggerSource | null;
 }
 
 function formatDuration(totalSeconds: number): string {
@@ -88,6 +96,18 @@ export function MeetingLibrary({ onSelectMeeting, onDelete, refreshToken }: Meet
                 {formatDate(m.created_at)} · {formatDuration(m.duration_secs)}
               </span>
             </div>
+            {/* ISC-253: same certainty at a glance, lower-key than the
+                detail view — icon plus a one-word tag. Absent entirely
+                for pre-provenance rows. */}
+            {triggerSourceShortLabel(m.trigger_source) && (
+              <span
+                className={`library-row__trigger library-row__trigger--${m.trigger_source}`}
+                title={`Recorded: ${triggerSourceDetailLabel(m.trigger_source)}`}
+              >
+                <span aria-hidden="true">{triggerSourceIcon(m.trigger_source)}</span>{" "}
+                {triggerSourceShortLabel(m.trigger_source)}
+              </span>
+            )}
             <span className={`library-row__status library-row__status--${m.status}`}>{m.status}</span>
             <button
               type="button"

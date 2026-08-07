@@ -5,7 +5,7 @@
 
 use crate::keychain;
 use rusqlite::Connection;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -242,7 +242,77 @@ fn apply_column_migrations(conn: &Connection) -> Result<(), StorageError> {
     if !has_deleted_at {
         conn.execute_batch("ALTER TABLE meetings ADD COLUMN deleted_at TEXT;")?;
     }
+
+    // ISC-245. Deliberately nullable with no default: rows created before
+    // this column existed genuinely have no recorded trigger, and a
+    // `NOT NULL DEFAULT 'manual'` would retroactively assert something
+    // false about every historical meeting — including real KCG client
+    // calls that were auto-joined. NULL reads back as "unknown", which is
+    // the honest answer.
+    let has_trigger_source = conn.prepare("SELECT trigger_source FROM meetings LIMIT 1").is_ok();
+    if !has_trigger_source {
+        conn.execute_batch("ALTER TABLE meetings ADD COLUMN trigger_source TEXT;")?;
+    }
     Ok(())
+}
+
+/// How a recording actually started (ISC-247). Persisted per meeting so a
+/// past meeting's capture method is never ambiguous after the fact.
+///
+/// An enum rather than a bare `String` on purpose: a typo'd or invented
+/// value becomes a compile error instead of a silently-wrong row that
+/// nobody notices until they're trying to reconstruct what happened
+/// months later.
+///
+/// `Recovered` is its own honest value, not a guess at which of the other
+/// three a crash-orphaned recording originally was — that information did
+/// not survive the crash, and inventing it would defeat the entire point
+/// of recording provenance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TriggerSource {
+    /// The Start Recording button.
+    Manual,
+    /// AutoJoinRecording — a scheduled calendar meeting, any provider.
+    Calendar,
+    /// TeamsPresenceAdhocRecording — an ad-hoc call detected via presence.
+    Presence,
+    /// Startup orphan recovery after a crash (ISC-217-221).
+    Recovered,
+}
+
+impl TriggerSource {
+    /// The exact string stored in SQLite. Kept identical to the serde
+    /// representation so the DB value and the JSON the frontend switches
+    /// on can never drift apart.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TriggerSource::Manual => "manual",
+            TriggerSource::Calendar => "calendar",
+            TriggerSource::Presence => "presence",
+            TriggerSource::Recovered => "recovered",
+        }
+    }
+
+    /// Lenient on purpose: an unrecognized stored value degrades to
+    /// `None` ("unknown") rather than failing the whole query or being
+    /// coerced into some arbitrary variant. Reads should never be the
+    /// place a bad value takes the library view down.
+    pub fn from_db_str(value: &str) -> Option<Self> {
+        match value {
+            "manual" => Some(TriggerSource::Manual),
+            "calendar" => Some(TriggerSource::Calendar),
+            "presence" => Some(TriggerSource::Presence),
+            "recovered" => Some(TriggerSource::Recovered),
+            _ => None,
+        }
+    }
+}
+
+/// `NULL` (pre-migration row) and an unrecognized string both mean the
+/// same thing to a reader: we don't know how this was captured.
+fn trigger_source_from_column(value: Option<String>) -> Option<TriggerSource> {
+    value.as_deref().and_then(TriggerSource::from_db_str)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -252,12 +322,24 @@ pub struct MeetingListItem {
     pub title: Option<String>,
     pub duration_secs: i64,
     pub status: String,
+    /// `None` for meetings recorded before RecordingTriggerProvenance.
+    pub trigger_source: Option<TriggerSource>,
 }
 
-pub fn create_meeting(conn: &Connection, audio_path: &str, duration_secs: u64) -> Result<i64, StorageError> {
+/// `trigger_source` is a required parameter, not an `Option` with a
+/// default (ISC-246): every caller must state how the recording it is
+/// persisting actually started. Rust has no default arguments, so a new
+/// recording path that forgets to say is a compile error, not a row
+/// quietly mislabeled `manual`.
+pub fn create_meeting(
+    conn: &Connection,
+    audio_path: &str,
+    duration_secs: u64,
+    trigger_source: TriggerSource,
+) -> Result<i64, StorageError> {
     conn.execute(
-        "INSERT INTO meetings (created_at, duration_secs, audio_path, status) VALUES (datetime('now'), ?1, ?2, 'processing')",
-        rusqlite::params![duration_secs as i64, audio_path],
+        "INSERT INTO meetings (created_at, duration_secs, audio_path, status, trigger_source) VALUES (datetime('now'), ?1, ?2, 'processing', ?3)",
+        rusqlite::params![duration_secs as i64, audio_path, trigger_source.as_str()],
     )?;
     Ok(conn.last_insert_rowid())
 }
@@ -536,7 +618,7 @@ pub fn undelete_meeting(conn: &Connection, meeting_id: i64) -> Result<(), Storag
 
 pub fn list_meetings(conn: &Connection) -> Result<Vec<MeetingListItem>, StorageError> {
     let mut stmt = conn.prepare(
-        "SELECT id, created_at, title, duration_secs, status FROM meetings WHERE deleted_at IS NULL ORDER BY created_at DESC",
+        "SELECT id, created_at, title, duration_secs, status, trigger_source FROM meetings WHERE deleted_at IS NULL ORDER BY created_at DESC",
     )?;
     let rows = stmt.query_map([], |row| {
         Ok(MeetingListItem {
@@ -545,6 +627,7 @@ pub fn list_meetings(conn: &Connection) -> Result<Vec<MeetingListItem>, StorageE
             title: row.get(2)?,
             duration_secs: row.get(3)?,
             status: row.get(4)?,
+            trigger_source: trigger_source_from_column(row.get(5)?),
         })
     })?;
     let mut out = Vec::new();
@@ -588,14 +671,28 @@ pub struct MeetingDetail {
     pub transcript: Vec<TranscriptSegmentRow>,
     pub action_items: Vec<ActionItemRow>,
     pub audio_path: Option<String>,
+    /// How this meeting was captured (ISC-252). `None` for meetings
+    /// recorded before RecordingTriggerProvenance existed — the UI shows
+    /// nothing rather than inventing a label.
+    pub trigger_source: Option<TriggerSource>,
 }
 
 pub fn get_meeting_detail(conn: &Connection, meeting_id: i64) -> Result<MeetingDetail, StorageError> {
-    let (created_at, title, duration_secs, status, error_message, audio_path) = conn
+    let (created_at, title, duration_secs, status, error_message, audio_path, trigger_source) = conn
         .query_row(
-            "SELECT created_at, title, duration_secs, status, error_message, audio_path FROM meetings WHERE id = ?1",
+            "SELECT created_at, title, duration_secs, status, error_message, audio_path, trigger_source FROM meetings WHERE id = ?1",
             [meeting_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    trigger_source_from_column(row.get(6)?),
+                ))
+            },
         )
         .map_err(|_| StorageError::MeetingNotFound(meeting_id))?;
 
@@ -656,6 +753,7 @@ pub fn get_meeting_detail(conn: &Connection, meeting_id: i64) -> Result<MeetingD
         transcript,
         action_items,
         audio_path,
+        trigger_source,
     })
 }
 
@@ -759,7 +857,7 @@ mod tests {
         assert!(list.is_empty(), "old dev row is expected to be gone after a dev-schema reset");
 
         // And the schema now genuinely supports the new columns.
-        let id = create_meeting(&conn, "/some/path.wav", 42).unwrap();
+        let id = create_meeting(&conn, "/some/path.wav", 42, TriggerSource::Manual).unwrap();
         mark_meeting_ready(&conn, id, "Test Meeting").unwrap();
         let list = list_meetings(&conn).unwrap();
         assert_eq!(list[0].title.as_deref(), Some("Test Meeting"));
@@ -768,7 +866,7 @@ mod tests {
     #[test]
     fn ensure_schema_is_a_true_noop_when_schema_already_current() {
         let conn = test_db();
-        let id = create_meeting(&conn, "/a.wav", 10).unwrap();
+        let id = create_meeting(&conn, "/a.wav", 10, TriggerSource::Manual).unwrap();
         mark_meeting_ready(&conn, id, "Keep Me").unwrap();
 
         // Calling ensure_schema again (e.g. every command handler does
@@ -783,7 +881,7 @@ mod tests {
     #[test]
     fn full_lifecycle_create_populate_read_back() {
         let conn = test_db();
-        let id = create_meeting(&conn, "/path/to/audio.wav", 125).unwrap();
+        let id = create_meeting(&conn, "/path/to/audio.wav", 125, TriggerSource::Manual).unwrap();
 
         insert_transcript_segment(&conn, id, 0, Some(0), 0, 5000, "Hello there.").unwrap();
         insert_transcript_segment(&conn, id, 1, Some(1), 5000, 9000, "General Kenobi.").unwrap();
@@ -809,7 +907,7 @@ mod tests {
     #[test]
     fn failed_meeting_records_error_and_status() {
         let conn = test_db();
-        let id = create_meeting(&conn, "/path/to/audio.wav", 60).unwrap();
+        let id = create_meeting(&conn, "/path/to/audio.wav", 60, TriggerSource::Manual).unwrap();
         mark_meeting_failed(&conn, id, "ASR model failed to load").unwrap();
 
         let detail = get_meeting_detail(&conn, id).unwrap();
@@ -827,9 +925,9 @@ mod tests {
     #[test]
     fn list_meetings_orders_newest_first() {
         let conn = test_db();
-        let id1 = create_meeting(&conn, "a.wav", 10).unwrap();
+        let id1 = create_meeting(&conn, "a.wav", 10, TriggerSource::Manual).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(1100)); // ensure distinct created_at timestamps
-        let id2 = create_meeting(&conn, "b.wav", 20).unwrap();
+        let id2 = create_meeting(&conn, "b.wav", 20, TriggerSource::Manual).unwrap();
 
         let list = list_meetings(&conn).unwrap();
         assert_eq!(list[0].id, id2);
@@ -846,7 +944,7 @@ mod tests {
         {
             let conn = open_connection(&path).unwrap();
             ensure_schema(&conn).unwrap();
-            create_meeting(&conn, "unmistakable-plaintext-marker.wav", 42).unwrap();
+            create_meeting(&conn, "unmistakable-plaintext-marker.wav", 42, TriggerSource::Manual).unwrap();
         }
 
         let raw = std::fs::read(&path).unwrap();
@@ -866,7 +964,7 @@ mod tests {
         {
             let conn = open_connection(&path).unwrap();
             ensure_schema(&conn).unwrap();
-            create_meeting(&conn, "real-key-wrote-this.wav", 10).unwrap();
+            create_meeting(&conn, "real-key-wrote-this.wav", 10, TriggerSource::Manual).unwrap();
         }
 
         let wrong_key_conn = Connection::open(&path).unwrap();
@@ -889,7 +987,7 @@ mod tests {
             // connection with real schema and a real row already in it.
             let plain = Connection::open(&path).unwrap();
             ensure_schema(&plain).unwrap();
-            create_meeting(&plain, "pre-encryption-dev-data.wav", 5).unwrap();
+            create_meeting(&plain, "pre-encryption-dev-data.wav", 5, TriggerSource::Manual).unwrap();
         }
 
         let conn = open_connection(&path).unwrap();
@@ -909,7 +1007,7 @@ mod tests {
     #[test]
     fn rename_meeting_updates_title() {
         let conn = test_db();
-        let id = create_meeting(&conn, "a.wav", 10).unwrap();
+        let id = create_meeting(&conn, "a.wav", 10, TriggerSource::Manual).unwrap();
         mark_meeting_ready(&conn, id, "Original Title").unwrap();
 
         rename_meeting(&conn, id, "Strategy Call with Nesta").unwrap();
@@ -928,7 +1026,7 @@ mod tests {
     #[test]
     fn deleted_meeting_disappears_from_list_but_undelete_restores_it() {
         let conn = test_db();
-        let id = create_meeting(&conn, "a.wav", 10).unwrap();
+        let id = create_meeting(&conn, "a.wav", 10, TriggerSource::Manual).unwrap();
         mark_meeting_ready(&conn, id, "Real Meeting").unwrap();
         assert_eq!(list_meetings(&conn).unwrap().len(), 1);
 
@@ -972,9 +1070,126 @@ mod tests {
         ensure_schema(&conn).unwrap();
         ensure_schema(&conn).unwrap();
 
-        let id = create_meeting(&conn, "a.wav", 5).unwrap();
+        let id = create_meeting(&conn, "a.wav", 5, TriggerSource::Manual).unwrap();
         delete_meeting(&conn, id).unwrap();
         assert!(list_meetings(&conn).unwrap().is_empty());
+    }
+
+    /// ISC-245: the real migration case — a database whose `meetings`
+    /// table predates `trigger_source` entirely, with a row already in it.
+    /// `ensure_schema` must add the column without erroring, must be safe
+    /// to re-run, and must leave the pre-existing row readable. That row
+    /// reads back as `None` rather than a fabricated value: nobody recorded
+    /// how it was captured, and guessing would be a lie.
+    #[test]
+    fn trigger_source_column_migration_is_idempotent_and_preserves_pre_existing_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        // The exact schema shape that shipped BEFORE this feature —
+        // `deleted_at` present (so `reset_if_schema_outdated` leaves it
+        // alone), `trigger_source` absent.
+        conn.execute_batch(
+            "CREATE TABLE meetings (
+                id INTEGER PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                title TEXT,
+                duration_secs INTEGER NOT NULL DEFAULT 0,
+                audio_path TEXT,
+                status TEXT NOT NULL DEFAULT 'processing',
+                error_message TEXT,
+                deleted_at TEXT
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO meetings (created_at, title, duration_secs, audio_path, status)
+             VALUES (datetime('now'), 'Legacy KCG Call', 900, '/legacy.wav', 'ready')",
+            [],
+        )
+        .unwrap();
+        let legacy_id = conn.last_insert_rowid();
+
+        // Twice: the migration must be idempotent, exactly like deleted_at's.
+        ensure_schema(&conn).unwrap();
+        ensure_schema(&conn).unwrap();
+
+        let has_column = conn.prepare("SELECT trigger_source FROM meetings LIMIT 1").is_ok();
+        assert!(has_column, "the trigger_source column should exist after migration");
+
+        // The pre-migration row is untouched and still readable.
+        let legacy = get_meeting_detail(&conn, legacy_id).unwrap();
+        assert_eq!(legacy.title.as_deref(), Some("Legacy KCG Call"));
+        assert_eq!(legacy.duration_secs, 900);
+        assert_eq!(
+            legacy.trigger_source, None,
+            "a meeting recorded before this feature has no honest trigger value — None, never a guess"
+        );
+
+        // And the migrated table genuinely accepts new writes.
+        let id = create_meeting(&conn, "/new.wav", 30, TriggerSource::Calendar).unwrap();
+        assert_eq!(get_meeting_detail(&conn, id).unwrap().trigger_source, Some(TriggerSource::Calendar));
+        assert_eq!(list_meetings(&conn).unwrap().len(), 2);
+    }
+
+    /// ISC-246/247: all four variants survive a real write/read cycle
+    /// through SQLite as their own distinct value — no collapsing,
+    /// no defaulting, `Recovered` staying `Recovered`.
+    #[test]
+    fn every_trigger_source_variant_round_trips_through_storage() {
+        let conn = test_db();
+        for expected in [
+            TriggerSource::Manual,
+            TriggerSource::Calendar,
+            TriggerSource::Presence,
+            TriggerSource::Recovered,
+        ] {
+            let id = create_meeting(&conn, &format!("/{}.wav", expected.as_str()), 10, expected).unwrap();
+            let detail = get_meeting_detail(&conn, id).unwrap();
+            assert_eq!(
+                detail.trigger_source,
+                Some(expected),
+                "{expected:?} must read back as itself, not as another variant or a default"
+            );
+        }
+    }
+
+    /// ISC-247: the four on-the-wire strings are part of the contract —
+    /// they are what lands in SQLite AND what the frontend switches on.
+    /// A silent rename here would orphan every already-stored row and
+    /// break the UI label at the same time.
+    #[test]
+    fn trigger_source_uses_the_exact_four_lowercase_wire_strings() {
+        let cases = [
+            (TriggerSource::Manual, "manual"),
+            (TriggerSource::Calendar, "calendar"),
+            (TriggerSource::Presence, "presence"),
+            (TriggerSource::Recovered, "recovered"),
+        ];
+        for (variant, wire) in cases {
+            assert_eq!(variant.as_str(), wire);
+            assert_eq!(TriggerSource::from_db_str(wire), Some(variant));
+            // Same string on the JSON side the frontend actually reads.
+            assert_eq!(serde_json::to_string(&variant).unwrap(), format!("\"{wire}\""));
+        }
+        assert_eq!(
+            TriggerSource::from_db_str("teleported"),
+            None,
+            "an unrecognized stored value must degrade to unknown, never be coerced into a wrong variant"
+        );
+    }
+
+    /// ISC-253: the library list needs the same certainty as the detail
+    /// view, so the value has to come back from `list_meetings` too —
+    /// not only `get_meeting_detail`.
+    #[test]
+    fn list_meetings_carries_each_rows_trigger_source() {
+        let conn = test_db();
+        create_meeting(&conn, "/p.wav", 10, TriggerSource::Presence).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1100)); // distinct created_at
+        create_meeting(&conn, "/r.wav", 20, TriggerSource::Recovered).unwrap();
+
+        let list = list_meetings(&conn).unwrap();
+        assert_eq!(list[0].trigger_source, Some(TriggerSource::Recovered));
+        assert_eq!(list[1].trigger_source, Some(TriggerSource::Presence));
     }
 
     #[test]
@@ -1004,7 +1219,7 @@ mod tests {
     #[test]
     fn label_meeting_speaker_upserts_and_resolves_in_meeting_detail() {
         let conn = test_db();
-        let meeting_id = create_meeting(&conn, "a.wav", 10).unwrap();
+        let meeting_id = create_meeting(&conn, "a.wav", 10, TriggerSource::Manual).unwrap();
         mark_meeting_ready(&conn, meeting_id, "Real Meeting").unwrap();
         insert_transcript_segment(&conn, meeting_id, 0, Some(0), 0, 1000, "hello").unwrap();
         insert_transcript_segment(&conn, meeting_id, 1, Some(1), 1000, 2000, "hi there").unwrap();
@@ -1031,7 +1246,7 @@ mod tests {
     #[test]
     fn unlabeled_speaker_falls_back_to_none() {
         let conn = test_db();
-        let meeting_id = create_meeting(&conn, "a.wav", 10).unwrap();
+        let meeting_id = create_meeting(&conn, "a.wav", 10, TriggerSource::Manual).unwrap();
         mark_meeting_ready(&conn, meeting_id, "Real Meeting").unwrap();
         insert_transcript_segment(&conn, meeting_id, 0, Some(0), 0, 1000, "hello").unwrap();
 
@@ -1047,7 +1262,7 @@ mod tests {
         // boundary between them. An index-wide label would mislabel
         // whichever person didn't get to type their own name.
         let conn = test_db();
-        let meeting_id = create_meeting(&conn, "a.wav", 3000).unwrap();
+        let meeting_id = create_meeting(&conn, "a.wav", 3000, TriggerSource::Manual).unwrap();
         mark_meeting_ready(&conn, meeting_id, "Merged Speakers Call").unwrap();
         insert_transcript_segment(&conn, meeting_id, 0, Some(0), 0, 1000, "Jeremiah's first line").unwrap();
         insert_transcript_segment(&conn, meeting_id, 1, Some(0), 1000, 2000, "Jeremiah's second line").unwrap();
@@ -1083,7 +1298,7 @@ mod tests {
     #[test]
     fn segment_override_takes_precedence_over_index_wide_label() {
         let conn = test_db();
-        let meeting_id = create_meeting(&conn, "a.wav", 10).unwrap();
+        let meeting_id = create_meeting(&conn, "a.wav", 10, TriggerSource::Manual).unwrap();
         mark_meeting_ready(&conn, meeting_id, "Real Meeting").unwrap();
         insert_transcript_segment(&conn, meeting_id, 0, Some(0), 0, 1000, "hello").unwrap();
         insert_transcript_segment(&conn, meeting_id, 1, Some(0), 1000, 2000, "actually someone else").unwrap();
@@ -1106,7 +1321,7 @@ mod tests {
     #[test]
     fn clear_meeting_processing_data_removes_everything_a_reprocess_regenerates() {
         let conn = test_db();
-        let meeting_id = create_meeting(&conn, "a.wav", 10).unwrap();
+        let meeting_id = create_meeting(&conn, "a.wav", 10, TriggerSource::Manual).unwrap();
         mark_meeting_ready(&conn, meeting_id, "Real Meeting").unwrap();
         insert_transcript_segment(&conn, meeting_id, 0, Some(0), 0, 1000, "hello").unwrap();
         insert_summary(&conn, meeting_id, "a summary").unwrap();
