@@ -1,6 +1,8 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { formatElapsed } from "./RecordingControl";
+import { MicMuteIcon } from "./MicMuteIcon";
+import { useMicMute } from "./useMicMute";
 import "./RecordingBadge.css";
 
 /**
@@ -17,6 +19,10 @@ import "./RecordingBadge.css";
  */
 interface RecordingStatus {
   elapsed_secs: number;
+  /** ISC-273: the backend's authoritative mute state, so the poll the
+   *  badge already runs doubles as a self-heal if a `mic-mute-changed`
+   *  event is ever missed. */
+  mic_muted: boolean;
 }
 
 /**
@@ -28,6 +34,7 @@ const POLL_MS = 500;
 
 export function RecordingBadge() {
   const [elapsed, setElapsed] = useState<number | null>(null);
+  const { muted, setMuted, toggle } = useMicMute();
 
   // Both windows load the same CSS bundle (see main.tsx), so a bare
   // `body { background: transparent }` in RecordingBadge.css would leak
@@ -51,7 +58,9 @@ export function RecordingBadge() {
     const poll = () => {
       invoke<RecordingStatus | null>("recording_status")
         .then((status) => {
-          if (!cancelled) setElapsed(status ? status.elapsed_secs : null);
+          if (cancelled) return;
+          setElapsed(status ? status.elapsed_secs : null);
+          if (status) setMuted(status.mic_muted);
         })
         .catch(() => {
           // A failed status read must not blank out the indicator — the
@@ -67,13 +76,25 @@ export function RecordingBadge() {
       cancelled = true;
       clearInterval(timer);
     };
-  }, []);
+  }, [setMuted]);
 
   return (
-    <div className="recording-badge">
+    <div className={`recording-badge ${muted ? "recording-badge--muted" : ""}`}>
       <span className="recording-badge__dot" aria-hidden="true" />
-      <span className="recording-badge__label">Recording</span>
+      {/* Muted is a different WORD, not just a different colour — the badge's
+          whole job is to be unmistakable at a glance (ISC-275). */}
+      <span className="recording-badge__label">{muted ? "Muted" : "Recording"}</span>
       <span className="recording-badge__timer">{formatElapsed(elapsed ?? 0)}</span>
+      <button
+        type="button"
+        className="recording-badge__mute"
+        onClick={toggle}
+        aria-pressed={muted}
+        aria-label={muted ? "Unmute microphone capture" : "Mute microphone capture"}
+        title={`${muted ? "Unmute" : "Mute"} this recording (⌘⌥M)`}
+      >
+        <MicMuteIcon muted={muted} />
+      </button>
     </div>
   );
 }

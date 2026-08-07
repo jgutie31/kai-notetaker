@@ -218,10 +218,71 @@
   animation: dot-blink 1.1s steps(2, jump-none) infinite;
 }
 
+/* Muted: the blinking red "live" dot would be an outright lie — nothing
+   is reaching the file. Goes neutral and stops blinking (ISC-275). */
+.recording-screen__dot--muted {
+  background: var(--color-text-secondary);
+  animation: none;
+}
+
 @keyframes dot-blink {
   50% {
     opacity: 0.25;
   }
+}
+
+/* The main window's own mute control (ISC-275). Rendered only while
+   recording, because muting a recording that isn't running is meaningless
+   and a permanently-disabled button is just visual noise. */
+.mic-mute-button {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-full);
+  background: var(--color-surface-raised);
+  color: var(--color-text-primary);
+  font-family: var(--font-ui);
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+  transition:
+    background var(--duration-fast) var(--ease-standard),
+    border-color var(--duration-fast) var(--ease-standard),
+    color var(--duration-fast) var(--ease-standard);
+}
+
+.mic-mute-button:hover {
+  border-color: var(--color-accent);
+}
+
+.mic-mute-button:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+
+/* Filled amber, matching the badge overlay's muted treatment — the two
+   windows describe the same state, so they should look like it. */
+.mic-mute-button--muted {
+  background: var(--kcg-amber);
+  border-color: var(--kcg-amber);
+  color: #1a1d29;
+  font-weight: 600;
+}
+
+.mic-mute-button--muted:hover {
+  border-color: var(--kcg-amber);
+  filter: brightness(1.06);
+}
+
+.mic-mute-button__key {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  opacity: 0.62;
+  /* Tells the user the global hotkey exists without a separate help
+     affordance — it works from any app, which is the whole point. */
+  padding-left: var(--space-1);
 }
 
 .recording-screen__error {

@@ -50,6 +50,18 @@ html.recording-badge-window #root {
   animation: recording-badge-pulse 2s ease-in-out infinite;
 }
 
+/* While muted, the live-red dot would be actively misleading — nothing is
+   being captured. It goes grey and stops pulsing, so the badge reads as
+   "present but not listening" at a glance (ISC-275). */
+.recording-badge--muted .recording-badge__dot {
+  background: #8e8e93;
+  animation: none;
+}
+
+.recording-badge--muted .recording-badge__label {
+  color: #ffd60a;
+}
+
 .recording-badge__label {
   font-weight: 600;
   letter-spacing: 0.01em;
@@ -60,6 +72,47 @@ html.recording-badge-window #root {
   /* Tabular figures so the timer doesn't jitter horizontally each second. */
   font-variant-numeric: tabular-nums;
   color: #a1a1a6;
+}
+
+/* The one interactive element on the overlay. The badge body sets
+   `cursor: default` and `user-select: none` because it is a status readout;
+   this button deliberately opts back into feeling clickable. */
+.recording-badge__mute {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: 26px;
+  height: 26px;
+  margin-left: 2px;
+  padding: 0;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.06);
+  color: #f5f5f7;
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease, border-color 120ms ease;
+}
+
+.recording-badge__mute:hover {
+  background: rgba(255, 255, 255, 0.14);
+}
+
+.recording-badge__mute:focus-visible {
+  outline: 2px solid #0a84ff;
+  outline-offset: 1px;
+}
+
+/* Filled, not merely tinted: the muted state should look like an actively
+   engaged control, matching the slashed icon it contains. */
+.recording-badge--muted .recording-badge__mute {
+  background: #ffd60a;
+  border-color: #ffd60a;
+  color: #1c1c1e;
+}
+
+.recording-badge--muted .recording-badge__mute:hover {
+  background: #ffe066;
 }
 
 @keyframes recording-badge-pulse {

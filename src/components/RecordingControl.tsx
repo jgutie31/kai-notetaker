@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { MicMuteIcon } from "./MicMuteIcon";
+import { useMicMute } from "./useMicMute";
 import "./RecordingControl.css";
 
 interface InputDeviceInfo {
@@ -34,6 +36,11 @@ export function RecordingControl() {
   const [isBusy, setIsBusy] = useState(false);
   const [isSwitchingDevice, setIsSwitchingDevice] = useState(false);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // The main window gets its own mute control (ISC-275) rather than
+  // relying on the overlay: the badge can be behind a full-screen call
+  // window, and someone already looking at kai-notetaker shouldn't have to
+  // go hunting for the badge or remember the hotkey.
+  const { muted, toggle: toggleMute, error: muteError } = useMicMute();
 
   useEffect(() => {
     invoke<InputDeviceInfo[]>("list_audio_devices")
@@ -148,15 +155,36 @@ export function RecordingControl() {
 
       <div className="recording-screen__status">
         <span className="recording-screen__label">
-          {noDevices ? "No microphone available" : isRecording ? "Recording" : "Ready to record"}
+          {noDevices
+            ? "No microphone available"
+            : isRecording
+              ? muted
+                ? "Recording · mic muted"
+                : "Recording"
+              : "Ready to record"}
         </span>
 
         <div className={`recording-screen__timer ${isRecording ? "recording-screen__timer--visible" : ""}`}>
-          <span className="recording-screen__dot" />
+          <span className={`recording-screen__dot ${muted ? "recording-screen__dot--muted" : ""}`} />
           <span>{formatElapsed(elapsed)}</span>
         </div>
 
+        {isRecording && (
+          <button
+            type="button"
+            className={`mic-mute-button ${muted ? "mic-mute-button--muted" : ""}`}
+            onClick={toggleMute}
+            aria-pressed={muted}
+            aria-label={muted ? "Unmute microphone capture" : "Mute microphone capture"}
+          >
+            <MicMuteIcon muted={muted} />
+            <span>{muted ? "Muted · nothing is being captured" : "Mute my mic"}</span>
+            <kbd className="mic-mute-button__key">⌘⌥M</kbd>
+          </button>
+        )}
+
         {error && <div className="recording-screen__error">{error}</div>}
+        {muteError && <div className="recording-screen__error">{muteError}</div>}
 
         {!isRecording && lastSaved && !error && (
           <div className="recording-screen__last-saved">

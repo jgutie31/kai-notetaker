@@ -52,6 +52,16 @@ base64 = "0.22"
 open = "5.4.0"
 tauri-plugin-dialog = "2"
 
+# MicMuteToggle (ISC-274). Declared under the desktop-only target rather
+# than plain `[dependencies]` because the crate itself is
+# `#![cfg(not(any(target_os = "android", target_os = "ios")))]` — on mobile
+# it compiles to an empty crate and any reference to its types would be a
+# hard compile error. This is Tauri's own documented pattern for the
+# plugin, and it keeps the deliberately-deferred Windows build (which IS
+# desktop) inheriting it for free.
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tauri-plugin-global-shortcut = "2"
+
 [dev-dependencies]
 tempfile = "3"
 

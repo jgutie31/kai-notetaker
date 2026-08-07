@@ -199,7 +199,11 @@ const RECORDING_BADGE_LABEL: &str = "recording-badge";
 /// rather than a window, wide enough for "Recording" plus a `MM:SS` timer
 /// without truncating. Fixed for v1; draggable/resizable/configurable is
 /// explicitly out of scope.
-const RECORDING_BADGE_SIZE: (f64, f64) = (176.0, 44.0);
+///
+/// Widened from 176 to 216 for MicMuteToggle (ISC-275): the badge now also
+/// carries a real mute button, and squeezing it into the old width would
+/// have pushed the timer into the label.
+const RECORDING_BADGE_SIZE: (f64, f64) = (216.0, 44.0);
 
 /// Inset from the screen edge, matching the breathing room macOS's own
 /// screen-recording indicator leaves.
@@ -290,6 +294,16 @@ fn start_recording(
     // badge must never claim a recording that an early return above
     // prevented (ISC-243).
     set_recording_badge_visible(&app, true);
+
+    // ISC-277's UI half. The backend flag is unconditionally fresh-`false`
+    // per session, so this is purely about the windows: the badge overlay
+    // is built once at startup and merely shown/hidden, so its React tree
+    // never unmounts and would otherwise still be displaying the PREVIOUS
+    // recording's muted state the instant the next one appears.
+    {
+        use tauri::Emitter;
+        let _ = app.emit(MIC_MUTE_CHANGED_EVENT, MicMuteChangedPayload { muted: false });
+    }
     Ok(())
 }
 
@@ -318,13 +332,88 @@ struct StopRecordingResult {
 #[derive(serde::Serialize)]
 struct RecordingStatusPayload {
     elapsed_secs: u64,
+    /// Included so the badge's existing 500ms poll doubles as a
+    /// self-correcting backstop for the `mic-mute-changed` event
+    /// (ISC-273). The event is what makes the UI instant and poll-free;
+    /// this field is what makes a dropped event self-heal within half a
+    /// second instead of leaving the overlay lying about whether the mic
+    /// is live — which, for a mute indicator, is the one failure mode
+    /// that actually matters.
+    mic_muted: bool,
 }
 
 #[tauri::command]
 fn recording_status(state: State<RecordingState>) -> Option<RecordingStatusPayload> {
     let guard = state.0.lock().ok()?;
     let active = guard.as_ref()?;
-    Some(RecordingStatusPayload { elapsed_secs: active.started_at.elapsed().as_secs() })
+    Some(RecordingStatusPayload {
+        elapsed_secs: active.started_at.elapsed().as_secs(),
+        mic_muted: active.session.is_mic_muted(),
+    })
+}
+
+/// The event both windows listen on so neither has to poll for mute state
+/// (ISC-273). Emitted app-wide — the main window and the badge overlay are
+/// separate webviews, and a toggle originating in either one (or from the
+/// global hotkey, which belongs to neither) must be reflected in both.
+const MIC_MUTE_CHANGED_EVENT: &str = "mic-mute-changed";
+
+#[derive(Clone, serde::Serialize)]
+struct MicMuteChangedPayload {
+    muted: bool,
+}
+
+/// The ONE place mic-mute state changes (ISC-274).
+///
+/// Both entry points — the `toggle_mic_mute` command invoked from a UI
+/// click, and the global-shortcut callback registered in `run()` — call
+/// exactly this function. Deliberately not duplicated: two copies of
+/// "read, flip, store, emit" would be two places for the emit to be
+/// forgotten, and a hotkey that muted the mic without telling the badge
+/// is precisely the silent-state failure this feature exists to avoid.
+/// Same "one real call site" precedent as `set_recording_badge_visible`.
+///
+/// Takes `&AppHandle` rather than a `State<RecordingState>` so the hotkey
+/// callback — which is handed an `AppHandle` and nothing else — can call
+/// the identical function without the command's IPC-injected arguments.
+///
+/// Returns the NEW mute state, or a clear error when nothing is recording.
+/// Never panics on that path: pressing a global hotkey with no meeting in
+/// progress is an ordinary thing to do by accident, not a bug.
+fn toggle_mic_mute_inner(app: &tauri::AppHandle) -> Result<bool, String> {
+    use tauri::Emitter;
+
+    let new_muted = {
+        let state = app.state::<RecordingState>();
+        // `as_ref`, never `take` — this is a toggle on a recording that
+        // keeps running, not a stop (ISC-276).
+        let guard = state.0.lock().map_err(|_| "recording state lock poisoned")?;
+        let active = guard.as_ref().ok_or("no recording in progress")?;
+        let new_muted = !active.session.is_mic_muted();
+        active.session.set_mic_muted(new_muted);
+        new_muted
+        // Guard dropped here, before the emit below: emitting to every
+        // webview while still holding the recording lock would let a
+        // frontend listener's follow-up command deadlock against it.
+    };
+
+    if let Err(e) = app.emit(MIC_MUTE_CHANGED_EVENT, MicMuteChangedPayload { muted: new_muted }) {
+        // Logged, not fatal, and deliberately NOT rolled back: the audio
+        // gate has already changed, which is the part that matters. The
+        // UI can still recover on its next `recording_status` poll.
+        eprintln!("mic mute: failed to emit {MIC_MUTE_CHANGED_EVENT}: {e}");
+    }
+    Ok(new_muted)
+}
+
+/// Flip kai-notetaker's own mic capture between recording real audio and
+/// recording silence, returning the new state (ISC-273).
+///
+/// This is independent of Teams/Zoom/Meet's own mute — it changes only
+/// what this app writes to disk, never what the call hears.
+#[tauri::command]
+fn toggle_mic_mute(app: tauri::AppHandle) -> Result<bool, String> {
+    toggle_mic_mute_inner(&app)
 }
 
 #[tauri::command]
@@ -1402,9 +1491,69 @@ fn recover_orphaned_recordings(
     }
 }
 
+/// The system-wide mic-mute hotkey (ISC-274): **Cmd+Option+M** on macOS
+/// (Super+Alt+M elsewhere).
+///
+/// Deliberately NOT Cmd+Shift+M, which is Microsoft Teams' own mute
+/// shortcut. Two different mutes on one keystroke would be genuinely
+/// ambiguous — the user could never tell whether they had silenced the
+/// call, the recording, or both — and Phase 2 (driving the call app's mute
+/// from this same hotkey) is explicitly a separate, later decision.
+///
+/// Built through a function rather than a `const` because `Shortcut::new`
+/// is not `const fn`; both the registration in `run()`'s setup and the
+/// handler's equality check call this, so they cannot drift apart.
+#[cfg(desktop)]
+fn mic_mute_shortcut() -> tauri_plugin_global_shortcut::Shortcut {
+    use tauri_plugin_global_shortcut::{Code, Modifiers, Shortcut};
+    // `Modifiers::META` is normalized to `SUPER` inside `Shortcut::new`,
+    // which is Command on macOS — confirmed against global-hotkey's own
+    // source, not assumed.
+    Shortcut::new(Some(Modifiers::META | Modifiers::ALT), Code::KeyM)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    #[cfg(desktop)]
+    let global_shortcut_plugin = {
+        use tauri_plugin_global_shortcut::ShortcutState;
+
+        let watched = mic_mute_shortcut();
+        tauri_plugin_global_shortcut::Builder::new()
+            .with_handler(move |app, shortcut, event| {
+                // The handler is invoked for EVERY registered shortcut, so
+                // the identity check is required, not defensive noise.
+                if shortcut != &watched {
+                    return;
+                }
+                // Press only. Without this the toggle would fire twice per
+                // keystroke — once down, once up — netting out to no
+                // change at all, which is the classic global-shortcut bug.
+                if event.state() != ShortcutState::Pressed {
+                    return;
+                }
+                // The SAME function the `toggle_mic_mute` command calls
+                // (ISC-274) — no duplicated toggle logic, so the emit can
+                // never be forgotten on one path.
+                match toggle_mic_mute_inner(app) {
+                    Ok(muted) => println!(
+                        "mic mute: global hotkey toggled capture {}",
+                        if muted { "MUTED" } else { "LIVE" }
+                    ),
+                    // The overwhelmingly common case is "no recording is
+                    // running" — an ordinary accidental keypress, not a
+                    // fault worth surfacing to the user.
+                    Err(e) => eprintln!("mic mute: global hotkey ignored: {e}"),
+                }
+            })
+            .build()
+    };
+
+    let builder = tauri::Builder::default();
+    #[cfg(desktop)]
+    let builder = builder.plugin(global_shortcut_plugin);
+
+    builder
         .plugin(tauri_plugin_opener::init())
         // Native OS message dialogs, for the silence-based Stop/Continue
         // prompt (ISC-202). Registered exactly as the plugin's own v2 docs
@@ -1421,6 +1570,7 @@ pub fn run() {
             switch_recording_device,
             stop_recording,
             recording_status,
+            toggle_mic_mute,
             list_meetings,
             get_meeting_detail,
             check_missing_models,
@@ -1509,6 +1659,26 @@ pub fn run() {
             {
                 Ok(_) => println!("recording badge: overlay window created (hidden)"),
                 Err(e) => eprintln!("recording badge: failed to create the overlay window: {e}"),
+            }
+
+            // MicMuteToggle (ISC-274): bind the system-wide hotkey. Done
+            // here rather than via the plugin builder's `with_shortcut`
+            // because that returns a `Result` mid-chain, and a keyboard
+            // shortcut the OS refuses to grant (another app already owns
+            // the combination, or Accessibility permission is missing)
+            // must never be the reason this app fails to launch — the
+            // in-app mute button is unaffected either way.
+            #[cfg(desktop)]
+            {
+                use tauri_plugin_global_shortcut::GlobalShortcutExt;
+                let shortcut = mic_mute_shortcut();
+                match app.global_shortcut().register(shortcut) {
+                    Ok(()) => println!("mic mute: global hotkey registered (Cmd+Option+M)"),
+                    Err(e) => eprintln!(
+                        "mic mute: could not register the global hotkey ({e}) — \
+                         the badge's mute button still works"
+                    ),
+                }
             }
 
             // Load the four heavy models in a background OS thread so the

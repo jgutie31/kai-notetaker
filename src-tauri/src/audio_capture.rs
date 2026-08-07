@@ -291,6 +291,38 @@ impl StreamingResampler {
     }
 }
 
+/// The mute gate (ISC-271). Returns a **same-length** all-zero buffer when
+/// `muted`, otherwise the input untouched.
+///
+/// Two deliberate properties, both load-bearing:
+///
+/// 1. **Silence, never a skipped or shortened write.** The recording's
+///    timeline is defined purely by how many samples land in the shared
+///    buffer — the WAV's duration, the flusher's cursor, the elapsed
+///    timer's agreement with the saved file, and every diarization
+///    timestamp all derive from that count. Dropping muted samples would
+///    make a 40-minute meeting with 10 muted minutes save as a 30-minute
+///    file whose speaker timings all slide left by however much was muted.
+///    Writing zeros keeps wall-clock and file-time identical (ISC-276).
+///
+/// 2. **Takes and returns ownership.** The unmuted path — overwhelmingly
+///    the common one, running inside a real-time audio callback — is then
+///    a pure move with zero copying and zero allocation. Only the muted
+///    path allocates.
+///
+/// Kept as a free function on plain `Vec<f32>` rather than a method or an
+/// inline `if` inside the capture closure specifically so it is unit-
+/// testable against synthetic sample vectors with no audio hardware at
+/// all — the same pure-core/side-effecting-shell split `trailing_rms_of`
+/// and `auto_join.rs` already use.
+pub fn gate_muted(samples: Vec<f32>, muted: bool) -> Vec<f32> {
+    if muted {
+        vec![0.0; samples.len()]
+    } else {
+        samples
+    }
+}
+
 fn downmix_to_mono(data: &[f32], channels: usize) -> Vec<f32> {
     if channels <= 1 {
         return data.to_vec();
@@ -304,9 +336,22 @@ fn downmix_to_mono(data: &[f32], channels: usize) -> Vec<f32> {
 /// `CANONICAL_SAMPLE_RATE`-normalized mono samples into `buffer`. Shared
 /// by both `RecordingSession::start` and `switch_device` so the two paths
 /// can never drift apart in how they normalize audio.
+///
+/// `muted` is the live mute gate (ISC-271), read fresh on every callback.
+/// It is passed in — rather than owned per-stream — precisely so
+/// `switch_device` can hand the SAME `Arc` to the replacement stream and
+/// a mid-recording hardware change can never silently un-mute (ISC-272).
+///
+/// Gating happens on the very last value before it reaches `buffer`, in
+/// both branches. In the resampled branch that means gating the
+/// resampler's *output*, not its input: a sinc resampler carries ~128
+/// taps of internal history, so feeding it zeros would still emit a few
+/// milliseconds of real, pre-mute audio out the other side. Gating the
+/// output makes the muted span byte-exact silence with no leak window.
 fn build_capture_stream(
     device: &cpal::Device,
     buffer: Arc<Mutex<Vec<f32>>>,
+    muted: Arc<AtomicBool>,
 ) -> Result<cpal::Stream, AudioCaptureError> {
     let config = device.default_input_config()?;
     let native_rate = config.sample_rate();
@@ -318,7 +363,13 @@ fn build_capture_stream(
             stream_config,
             move |data: &[f32], _info: &cpal::InputCallbackInfo| {
                 let mono = downmix_to_mono(data, channels);
-                buffer.lock().unwrap().extend_from_slice(&mono);
+                // `Relaxed` is the right ordering for a standalone flag
+                // read in a real-time audio callback: there is no other
+                // memory whose visibility depends on it, so no fence is
+                // needed — only that the read is atomic and eventually
+                // sees the toggle, which Relaxed guarantees.
+                let gated = gate_muted(mono, muted.load(Ordering::Relaxed));
+                buffer.lock().unwrap().extend_from_slice(&gated);
             },
             move |err| eprintln!("audio input stream error: {err}"),
             Some(Duration::from_secs(5)),
@@ -334,7 +385,8 @@ fn build_capture_stream(
             let mono = downmix_to_mono(data, channels);
             match resampler.process(&mono) {
                 Ok(resampled) if !resampled.is_empty() => {
-                    buffer.lock().unwrap().extend_from_slice(&resampled);
+                    let gated = gate_muted(resampled, muted.load(Ordering::Relaxed));
+                    buffer.lock().unwrap().extend_from_slice(&gated);
                 }
                 Ok(_) => {} // not enough accumulated yet for a full chunk
                 Err(e) => eprintln!("resample error: {e}"),
@@ -417,6 +469,17 @@ pub struct RecordingSession {
     stream: Option<cpal::Stream>,
     buffer: Arc<Mutex<Vec<f32>>>,
     flusher: Option<FlusherHandle>,
+    /// MicMuteToggle (ISC-271): while `true`, the capture callbacks write
+    /// silence into `buffer` instead of real microphone samples. Held as
+    /// an `Arc` because it is shared with whichever capture stream is
+    /// currently live, and that stream can be replaced mid-recording by
+    /// `switch_device` — the flag has to outlive any individual stream.
+    ///
+    /// This is kai-notetaker's OWN mute, entirely independent of whatever
+    /// Teams/Zoom/Meet think their mute state is (which prior work proved
+    /// is not readable from the OS at all). It changes only what this app
+    /// records; it does not change what the call hears.
+    muted: Arc<AtomicBool>,
 }
 
 impl Drop for RecordingSession {
@@ -477,12 +540,18 @@ impl RecordingSession {
         let stop = Arc::new(AtomicBool::new(false));
         let join = spawn_flusher(writer, buffer.clone(), stop.clone());
 
+        // ISC-277: constructed fresh, `false`, on every single start. Mute
+        // is a property of one recording, never a sticky app setting — a
+        // meeting that ended muted must not silently swallow the first
+        // half of the next one.
+        let muted = Arc::new(AtomicBool::new(false));
+
         // Started last: no audio can be captured before there is a
         // writer thread ready to checkpoint it. If the stream fails to
         // build we must wind the flusher down by hand — `Self` was never
         // constructed, so its `Drop` would never run and the thread
         // would leak for the life of the process.
-        let stream = match build_capture_stream(&device, buffer.clone()) {
+        let stream = match build_capture_stream(&device, buffer.clone(), muted.clone()) {
             Ok(s) => s,
             Err(e) => {
                 stop.store(true, Ordering::SeqCst);
@@ -496,7 +565,28 @@ impl RecordingSession {
             stream: Some(stream),
             buffer,
             flusher: Some(FlusherHandle { stop, join }),
+            muted,
         })
+    }
+
+    /// Turn kai-notetaker's own mic capture on or off mid-recording
+    /// (ISC-273). Takes `&self`, not `&mut self`: the flag is atomic, so
+    /// no exclusive access is needed — which matters because the caller
+    /// in `lib.rs` holds the active recording behind a shared lock and
+    /// must not have to take it mutably just to flip a bool.
+    ///
+    /// The recording itself is completely untouched by this (ISC-276):
+    /// the stream keeps running, the flusher keeps checkpointing, the WAV
+    /// keeps growing at real-time rate. Only the *content* of the samples
+    /// being written changes — real audio, or silence.
+    pub fn set_mic_muted(&self, muted: bool) {
+        self.muted.store(muted, Ordering::SeqCst);
+    }
+
+    /// Whether this recording is currently writing silence instead of
+    /// real microphone audio.
+    pub fn is_mic_muted(&self) -> bool {
+        self.muted.load(Ordering::SeqCst)
     }
 
     /// RMS energy over the trailing `window_secs` of already-captured
@@ -528,9 +618,15 @@ impl RecordingSession {
     /// What this guarantees instead: no glitch, no corrupted samples, no
     /// data loss, and no change to the output file's sample rate no
     /// matter what the new device's native rate is.
+    ///
+    /// Mute survives the switch (ISC-272): the SAME `muted` `Arc` is
+    /// cloned into the replacement stream, never a fresh `false` one.
+    /// Swapping headsets mid-call must not be a hidden un-mute — that
+    /// would be the exact "recording something I thought was private"
+    /// failure this whole feature exists to prevent.
     pub fn switch_device(&mut self, device_name: &str) -> Result<(), AudioCaptureError> {
         let device = find_device_by_name(device_name)?;
-        let new_stream = build_capture_stream(&device, self.buffer.clone())?;
+        let new_stream = build_capture_stream(&device, self.buffer.clone(), self.muted.clone())?;
         // Assigning over `self.stream` drops the old `cpal::Stream` here,
         // which stops its callback and releases the old hardware
         // connection — the new stream is already playing by this point
@@ -1027,6 +1123,250 @@ mod tests {
         );
 
         let path = session.stop_and_write().unwrap();
+        delete_recording(&path).unwrap();
+        std::fs::remove_dir_all(&tmp_data_dir).ok();
+    }
+
+    /// ISC-271, the pure half: no audio hardware involved at all. Muted in
+    /// means a same-length, byte-for-byte zero buffer out — never a
+    /// shortened or skipped write, which is the property the entire
+    /// timeline guarantee rests on.
+    #[test]
+    fn gate_muted_returns_same_length_silence_when_muted() {
+        let samples = vec![0.9_f32, -0.4, 0.0, 0.25, -1.0];
+        let gated = gate_muted(samples.clone(), true);
+
+        assert_eq!(gated.len(), samples.len(), "muting must never change the sample COUNT");
+        assert!(
+            gated.iter().all(|&s| s == 0.0),
+            "every muted sample must be exactly 0.0, got {gated:?}"
+        );
+
+        // Empty and large buffers behave the same — no special cases.
+        assert_eq!(gate_muted(Vec::new(), true), Vec::<f32>::new());
+        let big = vec![0.5_f32; CANONICAL_SAMPLE_RATE as usize];
+        let gated_big = gate_muted(big, true);
+        assert_eq!(gated_big.len(), CANONICAL_SAMPLE_RATE as usize);
+        assert!(gated_big.iter().all(|&s| s == 0.0));
+    }
+
+    /// ISC-271, the other half: unmuted is an exact identity passthrough,
+    /// not "approximately the input." A gate that attenuated or rounded
+    /// real audio would silently degrade every recording.
+    #[test]
+    fn gate_muted_passes_input_through_unchanged_when_unmuted() {
+        let samples = vec![0.9_f32, -0.4, 0.0, 0.25, -1.0, f32::MIN_POSITIVE];
+        assert_eq!(gate_muted(samples.clone(), false), samples);
+
+        // A buffer that happens to already be silence is also unchanged —
+        // the function must not "helpfully" do anything on this path.
+        let already_silent = vec![0.0_f32; 128];
+        assert_eq!(gate_muted(already_silent.clone(), false), already_silent);
+
+        assert_eq!(gate_muted(Vec::new(), false), Vec::<f32>::new());
+    }
+
+    /// ISC-277: mute is per-recording state, never a sticky app setting.
+    /// A session that ended muted must not leave the next one deaf.
+    #[test]
+    fn a_fresh_recording_session_always_starts_unmuted() {
+        let tmp_data_dir = std::env::temp_dir().join(format!("kai-notetaker-test-freshmute-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp_data_dir).unwrap();
+
+        if list_input_devices().map(|d| d.is_empty()).unwrap_or(true) {
+            eprintln!("skipping: no input device available in this environment");
+            std::fs::remove_dir_all(&tmp_data_dir).ok();
+            return;
+        }
+
+        let first = RecordingSession::start(&tmp_data_dir, "fresh-mute-1").unwrap();
+        assert!(!first.is_mic_muted(), "a brand-new session must start unmuted");
+
+        // End the first recording in the muted state — the exact condition
+        // that could leak into a later session if the flag were shared.
+        first.set_mic_muted(true);
+        assert!(first.is_mic_muted());
+        let first_path = first.stop_and_write().unwrap();
+
+        let second = RecordingSession::start(&tmp_data_dir, "fresh-mute-2").unwrap();
+        assert!(
+            !second.is_mic_muted(),
+            "the next recording must start unmuted even though the previous one ended muted"
+        );
+        let second_path = second.stop_and_write().unwrap();
+
+        delete_recording(&first_path).unwrap();
+        delete_recording(&second_path).unwrap();
+        std::fs::remove_dir_all(&tmp_data_dir).ok();
+    }
+
+    /// ISC-272: switching input hardware mid-recording must never silently
+    /// un-mute.
+    ///
+    /// **Why this test asserts on `Arc::strong_count` and not only on the
+    /// captured samples.** The obvious check — "everything captured after
+    /// the switch is zero" — is a necessary condition but NOT a sufficient
+    /// one, and this was proven empirically rather than reasoned about: a
+    /// deliberately-broken `switch_device` that passed
+    /// `Arc::new(AtomicBool::new(false))` instead of `self.muted.clone()`
+    /// still passed a samples-only version of this test. The reason is
+    /// that a real microphone in a quiet room emits sample values of
+    /// exactly `0.0`, so "all zero" is indistinguishable from "correctly
+    /// muted" unless the test environment is guaranteed to be making
+    /// noise — which no CI machine is.
+    ///
+    /// The strong count IS a sufficient discriminator, and needs no sound
+    /// at all. After `start()` the flag has exactly two owners: this
+    /// struct's field and the live stream's capture closure. A correct
+    /// `switch_device` clones that same `Arc` into the replacement stream
+    /// and drops the old one, so the count is still 2 afterward. The
+    /// broken version leaves the session's `Arc` owned by the session
+    /// alone — count 1 — because the new stream is watching a completely
+    /// different flag that `set_mic_muted` can never reach.
+    ///
+    /// Both assertions are kept: the count proves the wiring, the samples
+    /// prove the wiring actually produces silence.
+    #[test]
+    fn switch_device_preserves_mute_state_across_a_device_swap() {
+        let tmp_data_dir = std::env::temp_dir().join(format!("kai-notetaker-test-switchmute-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp_data_dir).unwrap();
+
+        let devices = list_input_devices().unwrap_or_default();
+        if devices.is_empty() {
+            eprintln!("skipping: no input device available in this environment");
+            std::fs::remove_dir_all(&tmp_data_dir).ok();
+            return;
+        }
+        // Same single-device caveat as
+        // `switch_device_preserves_already_captured_audio_and_keeps_growing`:
+        // this machine has one real input, so the "switch" is to the same
+        // device by name. That still exercises the real teardown/rebuild
+        // path through `build_capture_stream`, which is precisely where a
+        // freshly-defaulted `muted` flag would have been introduced.
+        let device_name = devices[0].name.clone();
+
+        let mut session = RecordingSession::start(&tmp_data_dir, "switch-mute-test").unwrap();
+        session.set_mic_muted(true);
+        std::thread::sleep(Duration::from_millis(150));
+
+        // Baseline: the session's field plus exactly one live capture
+        // stream. Asserted rather than assumed, so that if the capture
+        // plumbing ever grows another owner of this flag, this test fails
+        // loudly here instead of quietly weakening the real check below.
+        assert_eq!(
+            Arc::strong_count(&session.muted),
+            2,
+            "expected the mute flag to be owned by the session and one live stream"
+        );
+
+        let len_before_switch = session.buffer.lock().unwrap().len();
+
+        session.switch_device(&device_name).unwrap();
+        std::thread::sleep(Duration::from_millis(250));
+
+        // THE discriminator (see the doc comment): the replacement stream
+        // must be watching this exact flag, not a fresh one.
+        assert_eq!(
+            Arc::strong_count(&session.muted),
+            2,
+            "after a device switch the NEW stream must share the session's own mute flag; \
+             a count of 1 means switch_device handed the new stream an unrelated flag that \
+             set_mic_muted can never reach — a silent un-mute"
+        );
+
+        assert!(
+            session.is_mic_muted(),
+            "the mute flag itself must survive a device switch"
+        );
+
+        let captured_after_switch: Vec<f32> = {
+            let buf = session.buffer.lock().unwrap();
+            buf[len_before_switch..].to_vec()
+        };
+        assert!(
+            !captured_after_switch.is_empty(),
+            "the replacement stream must actually be capturing, otherwise this proves nothing"
+        );
+        // Necessary but not sufficient on its own — see the doc comment.
+        assert!(
+            captured_after_switch.iter().all(|&s| s == 0.0),
+            "audio captured after a device switch while muted must be silence; found {} non-zero sample(s)",
+            captured_after_switch.iter().filter(|&&s| s != 0.0).count()
+        );
+
+        let path = session.stop_and_write().unwrap();
+        delete_recording(&path).unwrap();
+        std::fs::remove_dir_all(&tmp_data_dir).ok();
+    }
+
+    /// ISC-276 (anti-criterion): muting is not a pause. However many times
+    /// the toggle is flipped mid-recording, the session keeps running and
+    /// the file keeps growing at real-time rate — so the WAV's total
+    /// sample count still equals every sample the capture callbacks
+    /// produced, and duration accounting stays honest.
+    ///
+    /// The equality is checked exactly rather than within a tolerance: the
+    /// buffer `Arc` is cloned before `stop_and_write` consumes the session,
+    /// so after the stream is torn down it holds the definitive final
+    /// count, and the finalized WAV must contain precisely that many
+    /// frames. A mute implementation that skipped writes instead of
+    /// writing silence would fail this by exactly the muted duration.
+    #[test]
+    fn mute_toggles_never_change_duration_or_the_wavs_total_sample_count() {
+        let tmp_data_dir = std::env::temp_dir().join(format!("kai-notetaker-test-mutedur-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp_data_dir).unwrap();
+
+        if list_input_devices().map(|d| d.is_empty()).unwrap_or(true) {
+            eprintln!("skipping: no input device available in this environment");
+            std::fs::remove_dir_all(&tmp_data_dir).ok();
+            return;
+        }
+
+        let session = RecordingSession::start(&tmp_data_dir, "mute-duration-test").unwrap();
+        let buffer_handle = session.buffer.clone();
+        let began = std::time::Instant::now();
+
+        // Six toggles across the recording — far more churn than any real
+        // meeting, so any per-toggle loss would be six times amplified.
+        let mut last_len = 0usize;
+        for i in 0..6 {
+            session.set_mic_muted(i % 2 == 0);
+            std::thread::sleep(Duration::from_millis(120));
+            let len_now = buffer_handle.lock().unwrap().len();
+            assert!(
+                len_now > last_len,
+                "capture must keep advancing across toggle {i}: {last_len} -> {len_now}"
+            );
+            last_len = len_now;
+        }
+
+        let wall_clock = began.elapsed();
+        let path = session.stop_and_write().unwrap();
+
+        // The stream is dropped by now, so this is the final, settled count.
+        let total_captured = buffer_handle.lock().unwrap().len();
+        let reader = hound::WavReader::open(&path).unwrap();
+        let frames = reader.duration() as usize;
+        assert_eq!(
+            frames, total_captured,
+            "every captured sample — muted or not — must be in the WAV; \
+             a skipped-write mute would leave the file short"
+        );
+        assert_eq!(reader.spec().sample_rate, CANONICAL_SAMPLE_RATE);
+        drop(reader);
+
+        // And the file's own duration still tracks wall clock, not the
+        // number of unmuted spans. Generous lower bound only — real audio
+        // hardware takes a variable moment to spin up, and this asserts
+        // the mute gate didn't eat a third of the recording, which is what
+        // a skipped-write bug would actually look like here.
+        let file_secs = frames as f64 / CANONICAL_SAMPLE_RATE as f64;
+        assert!(
+            file_secs > wall_clock.as_secs_f64() * 0.7,
+            "a recording muted for half its length must still be ~{:.2}s long, got {file_secs:.2}s",
+            wall_clock.as_secs_f64()
+        );
+
         delete_recording(&path).unwrap();
         std::fs::remove_dir_all(&tmp_data_dir).ok();
     }
