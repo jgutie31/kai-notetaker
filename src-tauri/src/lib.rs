@@ -461,6 +461,15 @@ fn is_zoom_connected() -> Result<bool, String> {
     zoom::is_zoom_connected().map_err(|e| e.to_string())
 }
 
+/// One command for all three providers — `microsoft`/`google`/`zoom` — since
+/// they already share the exact same OAuth engine and UI shape. Forgets only
+/// the stored tokens, not the client ID: reconnecting is then just the
+/// browser consent flow, not re-pasting an Azure/Google/Zoom client ID.
+#[tauri::command]
+fn disconnect_provider(provider: String) -> Result<(), String> {
+    oauth::delete_tokens(&provider).map_err(|e| e.to_string())
+}
+
 #[derive(serde::Serialize)]
 struct UpcomingMeetingPayload {
     subject: String,
@@ -1360,6 +1369,7 @@ pub fn run() {
             is_google_calendar_connected,
             connect_zoom,
             is_zoom_connected,
+            disconnect_provider,
             list_upcoming_meetings,
             set_auto_join_enabled,
             get_auto_join_enabled,

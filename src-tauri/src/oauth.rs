@@ -332,7 +332,18 @@ pub fn load_tokens(provider: &str) -> Result<Option<StoredTokens>, OAuthError> {
     }
 }
 
-/// Test-only: real Keychain/Credential-Manager/Secret-Service entries
+/// Disconnects a provider by forgetting its stored tokens — a fresh
+/// `connect_*` (browser sign-in) is required to use it again. Deliberately
+/// leaves the stored client ID untouched: re-connecting is then just the
+/// consent flow, not re-pasting an Azure/Google/Zoom client ID that hasn't
+/// changed. Real production path, driven by the UI's Disconnect button —
+/// not test-only.
+pub fn delete_tokens(provider: &str) -> Result<(), OAuthError> {
+    keychain::delete_secret(&keychain_account(provider))?;
+    Ok(())
+}
+
+/// Test-only alias: real Keychain/Credential-Manager/Secret-Service entries
 /// persist across separate `cargo test` invocations (this is real OS
 /// storage, not an in-memory fixture that resets itself) — any test
 /// asserting a "nothing stored yet" precondition must actively clear that
@@ -340,8 +351,7 @@ pub fn load_tokens(provider: &str) -> Result<Option<StoredTokens>, OAuthError> {
 /// before.
 #[cfg(test)]
 pub(crate) fn delete_tokens_for_test(provider: &str) -> Result<(), OAuthError> {
-    keychain::delete_secret(&keychain_account(provider))?;
-    Ok(())
+    delete_tokens(provider)
 }
 
 #[cfg(test)]

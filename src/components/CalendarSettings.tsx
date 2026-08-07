@@ -151,6 +151,17 @@ export function CalendarSettings() {
     });
   };
 
+  const handleDisconnect = (provider: Provider) => {
+    setError(null);
+    // Optimistic, matching handleToggleAutoJoin's pattern — reverts to
+    // Connected if the Keychain delete actually failed.
+    setConnectedByProvider((prev) => ({ ...prev, [provider.key]: false }));
+    invoke("disconnect_provider", { provider: provider.key }).catch((e) => {
+      setError(String(e));
+      setConnectedByProvider((prev) => ({ ...prev, [provider.key]: true }));
+    });
+  };
+
   const handleConnect = (provider: Provider) => {
     const clientId = (clientIdDrafts[provider.key] ?? "").trim();
     if (!clientId) {
@@ -212,7 +223,16 @@ export function CalendarSettings() {
                 </button>
               </div>
             ) : (
-              <p className="calendar-settings__status">✓ Connected</p>
+              <div className="calendar-settings__connected-row">
+                <p className="calendar-settings__status">✓ Connected</p>
+                <button
+                  type="button"
+                  className="calendar-settings__disconnect"
+                  onClick={() => handleDisconnect(provider)}
+                >
+                  Disconnect
+                </button>
+              </div>
             )}
           </section>
         );

@@ -51,6 +51,21 @@
   font-weight: 600;
 }
 
+.calendar-settings__connected-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+.calendar-settings__disconnect {
+  font-size: 13px;
+  padding: 4px 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--color-border);
+  background: var(--color-surface);
+  color: var(--color-text-secondary);
+}
+
 .calendar-settings__auto-join {
   display: flex;
   flex-direction: column;

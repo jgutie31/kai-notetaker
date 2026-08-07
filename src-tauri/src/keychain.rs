@@ -41,8 +41,8 @@ pub(crate) fn set_secret(account: &str, value: &[u8]) -> Result<(), KeychainErro
 
 /// Idempotent: deleting an account that was never stored is success, not
 /// an error — the caller's intent ("this account should not exist") is
-/// already satisfied either way.
-#[cfg(test)]
+/// already satisfied either way. Real production path now (the Calendar
+/// tab's Disconnect button), not test-only.
 pub(crate) fn delete_secret(account: &str) -> Result<(), KeychainError> {
     let entry = Entry::new(SERVICE, account).map_err(|e| KeychainError::Access(e.to_string()))?;
     match entry.delete_credential() {
