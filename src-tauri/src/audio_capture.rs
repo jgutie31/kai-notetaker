@@ -230,6 +230,32 @@ pub fn one_shot_resample(samples: &[f32], input_rate: u32, output_rate: u32) -> 
     Ok(output)
 }
 
+/// RMS (root-mean-square) energy of the trailing `window_secs` of
+/// `samples`, at `CANONICAL_SAMPLE_RATE`. `None` when the buffer doesn't
+/// yet hold a full window — an honest "not enough audio to judge yet"
+/// rather than a misleadingly-quiet reading computed from a partial
+/// window.
+///
+/// Split out from `RecordingSession::trailing_rms` as a free function on a
+/// plain slice so the real math is unit-testable against a known
+/// sine-wave/silence buffer without needing live capture hardware — the
+/// same pure-core/side-effecting-shell split `auto_join.rs` uses.
+pub fn trailing_rms_of(samples: &[f32], window_secs: f32) -> Option<f32> {
+    if !window_secs.is_finite() || window_secs <= 0.0 {
+        return None;
+    }
+    let window_len = (window_secs as f64 * CANONICAL_SAMPLE_RATE as f64).round() as usize;
+    if window_len == 0 || samples.len() < window_len {
+        return None;
+    }
+    let tail = &samples[samples.len() - window_len..];
+    // f64 accumulation: a 60-second window at 48kHz is 2.88M terms, enough
+    // that f32 summation would lose real precision on quiet audio — which
+    // is exactly the regime this measurement has to be trustworthy in.
+    let sum_squares: f64 = tail.iter().map(|&s| (s as f64) * (s as f64)).sum();
+    Some((sum_squares / window_len as f64).sqrt() as f32)
+}
+
 /// A recording session: owns the temp file path (inside `data_dir`, never
 /// outside it) and the currently-active cpal stream. The stream can be
 /// swapped mid-recording via `switch_device` without losing any audio
@@ -270,6 +296,26 @@ impl RecordingSession {
             stream: Some(stream),
             buffer,
         })
+    }
+
+    /// RMS energy over the trailing `window_secs` of already-captured
+    /// audio, **without disturbing the live capture stream** (ISC-200):
+    /// this only takes a read lock on the shared buffer, exactly as the
+    /// capture callback itself does to append — no stream teardown, no
+    /// draining, no mutation of a single sample.
+    ///
+    /// `None` while fewer than `window_secs` of audio have been captured.
+    ///
+    /// Cost note, since this runs on an interval against a live recording:
+    /// a 60-second window is ~2.88M samples (~11.5MB), so the buffer mutex
+    /// is held for roughly a millisecond per call. That's the same lock the
+    /// cpal callback takes to append — and that callback already performs
+    /// a potentially-reallocating `extend_from_slice` under it — so this
+    /// stays well inside the contention envelope the capture path already
+    /// accepts, at one call per check interval rather than per audio chunk.
+    pub fn trailing_rms(&self, window_secs: f32) -> Option<f32> {
+        let buffer = self.buffer.lock().ok()?;
+        trailing_rms_of(&buffer, window_secs)
     }
 
     /// Switch the active input device mid-recording. Already-captured
@@ -471,6 +517,116 @@ mod tests {
         std::thread::sleep(Duration::from_millis(150));
         let len_after = session.buffer.lock().unwrap().len();
         assert!(len_after > len_before, "original stream should still be capturing after a failed switch");
+
+        let path = session.stop_and_write().unwrap();
+        delete_recording(&path).unwrap();
+        std::fs::remove_dir_all(&tmp_data_dir).ok();
+    }
+
+    /// ISC-200: the computed RMS is the real, textbook value for a known
+    /// signal — checked against the closed-form answer for a sine wave
+    /// (amplitude / sqrt(2)), not merely "some number came back."
+    #[test]
+    fn trailing_rms_matches_the_closed_form_value_for_known_signals() {
+        let window_secs = 1.0_f32;
+        let n = CANONICAL_SAMPLE_RATE as usize;
+
+        // Pure silence: exactly zero energy.
+        let silence = vec![0.0_f32; n];
+        let rms = trailing_rms_of(&silence, window_secs).expect("a full window of silence is measurable");
+        assert!(rms.abs() < 1e-6, "silence must read as ~0 RMS, got {rms}");
+
+        // A 440Hz sine at amplitude 0.5 — RMS is analytically 0.5/sqrt(2).
+        let amplitude = 0.5_f32;
+        let sine: Vec<f32> = (0..n)
+            .map(|i| amplitude * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / CANONICAL_SAMPLE_RATE as f32).sin())
+            .collect();
+        let expected = amplitude / 2.0_f32.sqrt();
+        let rms = trailing_rms_of(&sine, window_secs).expect("a full window of tone is measurable");
+        assert!(
+            (rms - expected).abs() < 1e-3,
+            "a 0.5-amplitude sine must read ~{expected} RMS (amplitude/sqrt(2)), got {rms}"
+        );
+
+        // A DC-offset constant: RMS equals the magnitude itself.
+        let constant = vec![-0.25_f32; n];
+        let rms = trailing_rms_of(&constant, window_secs).unwrap();
+        assert!((rms - 0.25).abs() < 1e-5, "RMS of a constant is its magnitude, got {rms}");
+    }
+
+    /// ISC-200: it reads the TRAILING window, not the whole buffer. This is
+    /// the property the entire silence detector rests on — a call that was
+    /// loud for 50 minutes and has now been silent for the last minute must
+    /// read as silent, or the prompt could never fire.
+    #[test]
+    fn trailing_rms_reads_only_the_tail_not_the_whole_buffer() {
+        let one_second = CANONICAL_SAMPLE_RATE as usize;
+
+        // 10 seconds of loud audio followed by 2 seconds of silence.
+        let mut buffer = vec![0.8_f32; one_second * 10];
+        buffer.extend(std::iter::repeat(0.0_f32).take(one_second * 2));
+
+        let tail_rms = trailing_rms_of(&buffer, 2.0).expect("2s window fits in a 12s buffer");
+        assert!(tail_rms.abs() < 1e-6, "the trailing 2s are silent, so RMS must be ~0, got {tail_rms}");
+
+        // Widen the window past the silence and the earlier loud audio
+        // reappears in the measurement — proving the window bound is real.
+        let wide_rms = trailing_rms_of(&buffer, 12.0).unwrap();
+        assert!(wide_rms > 0.5, "a 12s window covers the loud section, expected >0.5, got {wide_rms}");
+    }
+
+    /// ISC-200: not-enough-audio-yet is `None`, never a falsely-quiet
+    /// reading from a partial window — otherwise a recording would look
+    /// "silent" for its first minute and could be prompted to stop
+    /// immediately.
+    #[test]
+    fn trailing_rms_is_none_until_a_full_window_is_available() {
+        let one_second = CANONICAL_SAMPLE_RATE as usize;
+        let almost = vec![0.0_f32; one_second * 60 - 1];
+        assert_eq!(trailing_rms_of(&almost, 60.0), None, "one sample short of a full window is not yet measurable");
+
+        let exact = vec![0.0_f32; one_second * 60];
+        assert!(trailing_rms_of(&exact, 60.0).is_some(), "exactly a full window is measurable");
+
+        assert_eq!(trailing_rms_of(&[], 60.0), None);
+        assert_eq!(trailing_rms_of(&exact, 0.0), None, "a zero-length window is meaningless");
+        assert_eq!(trailing_rms_of(&exact, -5.0), None);
+        assert_eq!(trailing_rms_of(&exact, f32::NAN), None);
+    }
+
+    /// The real method on a real, live `RecordingSession` — proves
+    /// `trailing_rms` genuinely reads the live capture buffer and leaves
+    /// the stream running, not just that the free function's math works.
+    #[test]
+    fn trailing_rms_reads_a_live_session_without_disturbing_capture() {
+        let tmp_data_dir = std::env::temp_dir().join(format!("kai-notetaker-test-rms-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp_data_dir).unwrap();
+
+        if list_input_devices().map(|d| d.is_empty()).unwrap_or(true) {
+            eprintln!("skipping: no input device available in this environment");
+            std::fs::remove_dir_all(&tmp_data_dir).ok();
+            return;
+        }
+
+        let session = RecordingSession::start(&tmp_data_dir, "rms-live-test").unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+
+        // A 60-second window can't be satisfied by a 300ms recording.
+        assert_eq!(session.trailing_rms(60.0), None, "a fresh session has nowhere near 60s of audio");
+
+        // A window short enough to actually be filled returns a real,
+        // finite, non-negative reading.
+        let len_before = session.buffer.lock().unwrap().len();
+        if len_before > (0.05 * CANONICAL_SAMPLE_RATE as f32) as usize {
+            let rms = session.trailing_rms(0.05).expect("50ms of audio should be measurable by now");
+            assert!(rms.is_finite() && rms >= 0.0, "RMS must be a real non-negative value, got {rms}");
+        }
+
+        // The stream must still be capturing after being measured — the
+        // "without disturbing the live capture stream" half of ISC-200.
+        std::thread::sleep(Duration::from_millis(200));
+        let len_after = session.buffer.lock().unwrap().len();
+        assert!(len_after > len_before, "capture must keep running after an RMS read: before={len_before}, after={len_after}");
 
         let path = session.stop_and_write().unwrap();
         delete_recording(&path).unwrap();

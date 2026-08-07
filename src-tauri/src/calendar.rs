@@ -52,6 +52,13 @@ pub enum CalendarError {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct UpcomingMeeting {
+    /// The provider's stable primary key for this calendar occurrence.
+    /// For Microsoft this is the Graph `Event` resource's own `id` field
+    /// (documented at `learn.microsoft.com/graph/api/resources/event`),
+    /// not something derived from subject/time — nothing else in this
+    /// struct uniquely and stably identifies one occurrence across polls,
+    /// which is exactly what idempotent auto-join tracking needs.
+    pub id: String,
     pub subject: String,
     /// ISO 8601, as returned by Graph — parsing into a richer type is the
     /// UI's job, not this module's.
@@ -87,6 +94,7 @@ struct GraphOnlineMeeting {
 
 #[derive(Debug, Deserialize)]
 struct GraphEvent {
+    id: String,
     subject: String,
     start: GraphDateTimeTimeZone,
     end: GraphDateTimeTimeZone,
@@ -104,6 +112,7 @@ struct GraphEventList {
 impl From<GraphEvent> for UpcomingMeeting {
     fn from(e: GraphEvent) -> Self {
         UpcomingMeeting {
+            id: e.id,
             subject: e.subject,
             start: e.start.date_time,
             end: e.end.date_time,
@@ -187,6 +196,7 @@ mod tests {
     const REAL_SHAPED_GRAPH_RESPONSE: &str = r#"{
         "value": [
             {
+                "id": "AAMkAGI2TG93AAA=_ScopingCall",
                 "subject": "Smithville PCI-DSS Scoping Call",
                 "start": { "dateTime": "2026-08-10T14:00:00.0000000", "timeZone": "UTC" },
                 "end": { "dateTime": "2026-08-10T15:00:00.0000000", "timeZone": "UTC" },
@@ -198,6 +208,7 @@ mod tests {
                 "onlineMeeting": { "joinUrl": "https://teams.microsoft.com/l/meetup-join/real-meeting-id" }
             },
             {
+                "id": "AAMkAGI2TG93AAA=_NoOnlineMeeting",
                 "subject": "No attendees, no online meeting",
                 "start": { "dateTime": "2026-08-11T09:00:00.0000000", "timeZone": "UTC" },
                 "end": { "dateTime": "2026-08-11T09:30:00.0000000", "timeZone": "UTC" },
@@ -213,6 +224,15 @@ mod tests {
         let meetings: Vec<UpcomingMeeting> = list.value.into_iter().map(UpcomingMeeting::from).collect();
 
         assert_eq!(meetings.len(), 2);
+        // The Graph Event's own stable primary key — load-bearing for
+        // idempotent auto-join tracking (ISC-159/ISC-161). Asserted as a
+        // real value, not just non-empty, so a silently-renamed field
+        // would fail here rather than quietly producing empty ids that
+        // would collide with each other in `auto_join_log`.
+        assert_eq!(meetings[0].id, "AAMkAGI2TG93AAA=_ScopingCall");
+        assert!(!meetings[0].id.is_empty());
+        assert_eq!(meetings[1].id, "AAMkAGI2TG93AAA=_NoOnlineMeeting");
+        assert_ne!(meetings[0].id, meetings[1].id, "distinct occurrences must get distinct ids");
         assert_eq!(meetings[0].subject, "Smithville PCI-DSS Scoping Call");
         assert_eq!(meetings[0].start, "2026-08-10T14:00:00.0000000");
         assert_eq!(meetings[0].attendees, vec!["Nesta".to_string(), "dave@example.com".to_string()], "falls back to address when name is null");

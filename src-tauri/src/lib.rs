@@ -5,20 +5,24 @@
 pub mod asr;
 mod audio_capture;
 pub mod audit_log;
+mod auto_join;
 mod calendar;
 mod cloud_sync_gate;
 pub mod diarization;
 pub mod embeddings;
 mod frontier;
+mod google;
 mod keychain;
 pub mod llm;
 pub mod model_provisioning;
 mod oauth;
 pub mod pipeline;
 mod retention;
+mod silence_monitor;
 pub mod speaker_id;
 pub mod storage;
 mod summarization;
+mod zoom;
 
 use audit_log::AuditLog;
 use pipeline::PipelineEngines;
@@ -35,6 +39,21 @@ use tauri::{Manager, State};
 /// Tauri's managed state without any unsafe wrapper.
 #[derive(Default)]
 struct RecordingState(Mutex<Option<(audio_capture::RecordingSession, Instant)>>);
+
+/// Tracks the meeting AutoJoinRecording is currently capturing, if any —
+/// distinct from `RecordingState` itself so auto-stop only ever ends a
+/// recording *it* started, never a manually-started one that happens to
+/// still be running when a poll cycle fires (Jeremiah's real requirement:
+/// "make sure there IS an auto-stop when the call ends").
+#[derive(Default)]
+struct AutoRecordingState(Mutex<Option<AutoRecordingMarker>>);
+
+struct AutoRecordingMarker {
+    subject: String,
+    /// The meeting's real end time — parsed once at trigger time so the
+    /// stop check never has to re-fetch or re-parse anything.
+    end: chrono::DateTime<chrono::Utc>,
+}
 
 /// The four heavy local models, loaded once in a background OS thread at
 /// startup (not blocking the window from appearing) and shared across
@@ -149,11 +168,19 @@ fn stop_recording(
     state: State<RecordingState>,
     engines_state: State<EnginesState>,
     paths: State<AppPaths>,
+    auto_recording_state: State<AutoRecordingState>,
 ) -> Result<StopRecordingResult, String> {
     let mut guard = state.0.lock().map_err(|_| "recording state lock poisoned")?;
     let (session, started_at) = guard.take().ok_or("no recording in progress")?;
     let elapsed = started_at.elapsed().as_secs();
     let path = session.stop_and_write().map_err(|e| e.to_string())?;
+
+    // Clear the auto-recording marker on ANY stop — manual click or
+    // auto-stop — so a manually-stopped auto-triggered meeting doesn't
+    // get a second, redundant auto-stop attempt on the next poll cycle.
+    if let Ok(mut marker_guard) = auto_recording_state.0.lock() {
+        *marker_guard = None;
+    }
 
     let db_path = paths.data_dir.join("kai-notetaker.sqlite3");
     let audit_path = paths.data_dir.join("audit-log.jsonl");
@@ -266,6 +293,37 @@ fn is_microsoft_calendar_connected() -> Result<bool, String> {
     calendar::is_microsoft_connected().map_err(|e| e.to_string())
 }
 
+/// Google Calendar's equivalent of `connect_microsoft_calendar` — same
+/// store-then-consent shape, same blocking-for-up-to-3-minutes behavior,
+/// different provider. Distinct loopback port per provider purely so two
+/// connect flows started in quick succession can't collide on the same
+/// socket.
+#[tauri::command]
+fn connect_google_calendar(client_id: String) -> Result<(), String> {
+    oauth::store_client_id(google::GOOGLE_PROVIDER_ID, &client_id).map_err(|e| e.to_string())?;
+    google::connect_google(&client_id, 53683).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn is_google_calendar_connected() -> Result<bool, String> {
+    google::is_google_connected().map_err(|e| e.to_string())
+}
+
+/// Zoom's equivalent. The client ID here must come from a Zoom app
+/// registered with **Use Public Client OAuth** enabled — a standard
+/// (confidential) Zoom app's client ID will fail the token exchange,
+/// since this app deliberately sends no client secret (ISC-192).
+#[tauri::command]
+fn connect_zoom(client_id: String) -> Result<(), String> {
+    oauth::store_client_id(zoom::ZOOM_PROVIDER_ID, &client_id).map_err(|e| e.to_string())?;
+    zoom::connect_zoom(&client_id, 53684).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn is_zoom_connected() -> Result<bool, String> {
+    zoom::is_zoom_connected().map_err(|e| e.to_string())
+}
+
 #[derive(serde::Serialize)]
 struct UpcomingMeetingPayload {
     subject: String,
@@ -288,6 +346,369 @@ fn list_upcoming_meetings(hours_ahead: i64) -> Result<Vec<UpcomingMeetingPayload
                 .collect()
         })
         .map_err(|e| e.to_string())
+}
+
+/// Every provider this app can poll. Adding a fourth is one entry here
+/// plus its own module — `run_auto_join_cycle` below never names one.
+const ALL_PROVIDER_IDS: [&str; 3] =
+    [calendar::MICROSOFT_PROVIDER_ID, google::GOOGLE_PROVIDER_ID, zoom::ZOOM_PROVIDER_ID];
+
+/// One fetcher closure per *genuinely connected* provider — zero, one,
+/// two, or three of them (ISC-198).
+///
+/// "Connected" means both a stored client id AND stored tokens: a provider
+/// where Jeremiah pasted a client id but abandoned the browser consent has
+/// no usable credentials, and including it would fire a guaranteed-failing
+/// request every single poll cycle (ISC-199). That predicate lives in
+/// `auto_join::ProviderConnection::is_active` so it's unit-testable against
+/// a real 0/1/2/3 fixture matrix without writing fake tokens into the real
+/// Keychain slots.
+///
+/// A Keychain read that errors is treated as "not connected" rather than
+/// propagated: this runs on a background timer forever, and one transient
+/// secure-storage hiccup should cost one cycle, not kill the poller.
+fn active_fetchers() -> Vec<auto_join::MeetingFetcher> {
+    let states: Vec<auto_join::ProviderConnection> = ALL_PROVIDER_IDS
+        .iter()
+        .map(|provider_id| auto_join::ProviderConnection {
+            provider_id,
+            client_id: oauth::load_client_id(provider_id).unwrap_or(None),
+            has_tokens: oauth::load_tokens(provider_id).map(|t| t.is_some()).unwrap_or(false),
+        })
+        .collect();
+
+    auto_join::active_provider_client_ids(&states)
+        .into_iter()
+        .filter_map(|(provider_id, client_id)| -> Option<auto_join::MeetingFetcher> {
+            if provider_id == calendar::MICROSOFT_PROVIDER_ID {
+                Some(Box::new(move || {
+                    calendar::list_upcoming_meetings(&client_id, auto_join::FETCH_WINDOW_HOURS).map_err(|e| e.to_string())
+                }))
+            } else if provider_id == google::GOOGLE_PROVIDER_ID {
+                Some(Box::new(move || {
+                    google::list_upcoming_meetings(&client_id, auto_join::FETCH_WINDOW_HOURS).map_err(|e| e.to_string())
+                }))
+            } else if provider_id == zoom::ZOOM_PROVIDER_ID {
+                // No hours-ahead argument: Zoom's list endpoint has no
+                // time-window parameters at all (see `zoom::list_upcoming_meetings`).
+                Some(Box::new(move || zoom::list_upcoming_meetings(&client_id).map_err(|e| e.to_string())))
+            } else {
+                eprintln!("auto-join: no fetcher is registered for provider '{provider_id}' — skipping it this cycle");
+                None
+            }
+        })
+        .collect()
+}
+
+/// One AutoJoinRecording poll cycle: the side-effecting half of the
+/// feature. All the decision logic lives in `auto_join` (pure, unit
+/// tested); this function only supplies real inputs and carries out the
+/// results — open the link, start the recording, write the log row.
+///
+/// Every failure path here logs and returns. Nothing panics: this runs
+/// forever in a background task, and a panic would take a real recording
+/// down with it.
+fn run_auto_join_cycle(app: &tauri::AppHandle, db_path: &std::path::Path) {
+    // Auto-stop check runs FIRST and unconditionally — independent of the
+    // enabled toggle or a stored client id. A recording this feature
+    // already started must still get stopped even if Jeremiah unticks the
+    // box mid-meeting; leaving a mic capturing indefinitely is exactly the
+    // real risk he flagged ("make sure there IS an auto-stop when the call
+    // ends"). Distinct from the new-trigger path below, which IS gated.
+    {
+        let due_subject = match app.state::<AutoRecordingState>().0.lock() {
+            Ok(guard) => guard
+                .as_ref()
+                .and_then(|m| auto_join::should_auto_stop(m.end, chrono::Utc::now()).then(|| m.subject.clone())),
+            Err(_) => {
+                eprintln!("auto-join: auto-recording marker lock poisoned — skipping auto-stop check this cycle");
+                None
+            }
+        };
+        if let Some(subject) = due_subject {
+            match stop_recording(
+                app.state::<RecordingState>(),
+                app.state::<EnginesState>(),
+                app.state::<AppPaths>(),
+                app.state::<AutoRecordingState>(),
+            ) {
+                Ok(result) => println!("auto-join: auto-stopped '{subject}' — meeting_id={}", result.meeting_id),
+                Err(e) => eprintln!("auto-join: failed to auto-stop '{subject}': {e}"),
+            }
+        }
+    }
+
+    // First check, deliberately before touching the database (ISC-173):
+    // a user who has never connected ANY calendar gets zero poller
+    // activity — no error log, no work, no noise every 60 seconds. This
+    // is the per-provider generalization of the old Microsoft-only
+    // "no client id, return early" check: the poller now stands down only
+    // when nothing at all is connected, not when Microsoft specifically
+    // isn't (ISC-198).
+    let fetchers = active_fetchers();
+    if fetchers.is_empty() {
+        return;
+    }
+
+    let conn = match storage::open_connection(db_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("auto-join: failed to open db: {e}");
+            return;
+        }
+    };
+    if let Err(e) = storage::ensure_schema(&conn) {
+        eprintln!("auto-join: schema setup failed: {e}");
+        return;
+    }
+
+    // Re-read every cycle, never cached at startup — that's what makes
+    // unticking the box take effect within 60s (ISC-166).
+    let enabled = match storage::get_auto_join_enabled(&conn) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("auto-join: could not read the auto_join_enabled setting: {e}");
+            return;
+        }
+    };
+    if !enabled {
+        return;
+    }
+
+    let already_recording = match app.state::<RecordingState>().0.lock() {
+        Ok(guard) => guard.is_some(),
+        Err(_) => {
+            eprintln!("auto-join: recording state lock poisoned — skipping this cycle");
+            return;
+        }
+    };
+
+    let decisions = auto_join::poll_cycle(
+        enabled,
+        &fetchers,
+        chrono::Utc::now(),
+        already_recording,
+        &|event_id| storage::was_already_auto_joined(&conn, event_id).map_err(|e| e.to_string()),
+    );
+
+    for (meeting, decision) in decisions {
+        if !decision.opens_join_url() {
+            continue;
+        }
+        let Some(join_url) = meeting.join_url.as_deref() else { continue };
+
+        println!("auto-join: {} — opening join link ({decision:?})", meeting.subject);
+        if let Err(e) = open::that(join_url) {
+            eprintln!("auto-join: failed to open join link for '{}': {e}", meeting.subject);
+        }
+
+        if decision.starts_recording() {
+            // The exact same command function the Start Recording button
+            // calls — not a parallel recording path — so an auto-started
+            // meeting produces an identical on-disk artifact and runs the
+            // identical downstream pipeline (ISC-171).
+            if let Err(e) = start_recording(app.clone(), app.state::<RecordingState>()) {
+                eprintln!("auto-join: failed to start recording for '{}': {e}", meeting.subject);
+            } else {
+                println!("auto-join: started recording for '{}'", meeting.subject);
+                // Record what we started so the auto-stop check above can
+                // end THIS recording when the meeting's real end time
+                // passes — never a manually-started recording, since only
+                // this path ever writes the marker (ISC-181).
+                if let Some(end) = auto_join::parse_graph_utc(&meeting.end) {
+                    if let Ok(mut marker_guard) = app.state::<AutoRecordingState>().0.lock() {
+                        *marker_guard = Some(AutoRecordingMarker { subject: meeting.subject.clone(), end });
+                    }
+                } else {
+                    eprintln!(
+                        "auto-join: could not parse end time for '{}' — auto-stop will not fire for this meeting, manual stop still works",
+                        meeting.subject
+                    );
+                }
+            }
+        }
+
+        if decision.should_log() {
+            if let Err(e) = storage::log_auto_join(&conn, &meeting.id, &meeting.subject) {
+                eprintln!("auto-join: failed to record '{}' in the auto-join log: {e}", meeting.subject);
+            }
+        }
+    }
+}
+
+/// One tick of the silence monitor. Deliberately a synchronous function
+/// rather than inline async-block code: every mutex guard it takes is
+/// confined to this call, so none can be held across an `.await` in the
+/// caller's loop.
+///
+/// Order of checks is load-bearing:
+/// 1. **No auto-recording marker → do nothing, ever** (ISC-205). This is
+///    the hard scope boundary: a manually-started recording is never
+///    monitored and can never be prompted. The tracker is also reset here
+///    so a later auto-recording can't inherit a stale silence run.
+/// 2. A dialog already on screen → don't stack a second one.
+/// 3. No live recording → nothing to measure.
+/// 4. Only then: read RMS and feed the tracker.
+fn silence_monitor_tick(
+    app: &tauri::AppHandle,
+    tracker: &Mutex<silence_monitor::SilenceTracker>,
+    dialog_open: &Arc<std::sync::atomic::AtomicBool>,
+) {
+    use std::sync::atomic::Ordering;
+
+    // ISC-205 / ISC-206: this feature applies ONLY to recordings
+    // AutoJoinRecording itself started (the marker is written at
+    // auto-trigger time and nowhere else). Jeremiah's explicit scope cut:
+    // "No manual recording ideas for now on this functionality request."
+    let is_auto_started = match app.state::<AutoRecordingState>().0.lock() {
+        Ok(guard) => guard.is_some(),
+        Err(_) => return,
+    };
+
+    if dialog_open.load(Ordering::SeqCst) {
+        return;
+    }
+
+    // `None` here means "monitoring doesn't apply right now" — either this
+    // isn't an auto-started recording, or nothing is recording at all. Both
+    // clear the tracker so a later auto-recording can't inherit a stale
+    // silence run.
+    let rms: Option<Option<f32>> = if !is_auto_started {
+        None
+    } else {
+        match app.state::<RecordingState>().0.lock() {
+            Ok(guard) => guard
+                .as_ref()
+                .map(|(session, _)| session.trailing_rms(silence_monitor::SILENCE_WINDOW_SECS)),
+            Err(_) => return,
+        }
+    };
+
+    // The tracker guard is scoped to this block and dropped before the
+    // dialog is shown. Not cosmetic: `prompt_stop_or_continue`'s callback
+    // runs on the UI thread and locks this same tracker to handle
+    // "Continue", so holding the guard across `.show()` would risk a
+    // deadlock against a `std::sync::Mutex` that isn't reentrant.
+    let action = {
+        let Ok(mut tracker) = tracker.lock() else { return };
+        match rms {
+            Some(reading) => tracker.observe(reading, chrono::Utc::now()),
+            None => {
+                tracker.reset();
+                return;
+            }
+        }
+    };
+
+    if action != silence_monitor::SilenceAction::Prompt {
+        return;
+    }
+
+    println!(
+        "silence monitor: {}s of continuous silence on an auto-started recording — asking whether to stop",
+        silence_monitor::SILENCE_WINDOW_SECS
+    );
+    prompt_stop_or_continue(app, dialog_open.clone());
+}
+
+/// The native OS Stop/Continue prompt.
+///
+/// Non-blocking `.show()` with a callback (not `.blocking_show()`): this
+/// is reached from inside an async interval loop, and blocking there would
+/// stall the loop for as long as the dialog sits unanswered — which, given
+/// the realistic case is Jeremiah looking at the call rather than at this
+/// app, could be a very long time.
+///
+/// Verified against the installed `tauri-plugin-dialog` 2.7.2 source, not
+/// assumed: `MessageDialogButtons::OkCancelCustom(String, String)` and
+/// `show<F: FnOnce(bool) + Send + 'static>`, where the `bool` is `true`
+/// only when the FIRST custom label was clicked. So `true` = "Stop", and
+/// every other outcome — including dismissing the dialog outright — is
+/// `false` = "Continue". That default is the safe one: an ignored prompt
+/// leaves the recording running rather than silently ending a live meeting.
+fn prompt_stop_or_continue(app: &tauri::AppHandle, dialog_open: Arc<std::sync::atomic::AtomicBool>) {
+    use std::sync::atomic::Ordering;
+    use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
+
+    // Set before showing, cleared in the callback — the guard against
+    // stacking a second dialog while one is already on screen.
+    dialog_open.store(true, Ordering::SeqCst);
+
+    let app_for_callback = app.clone();
+    app.dialog()
+        .message("No one has spoken for the last minute. Is this meeting over?")
+        .title("Still recording?")
+        .buttons(MessageDialogButtons::OkCancelCustom("Stop".to_string(), "Continue".to_string()))
+        .show(move |stop| {
+            if stop {
+                // ISC-203: the exact same function every other stop path
+                // calls — the Stop Recording button, and ISC-181's
+                // calendar-end auto-stop. Not a parallel stop mechanism,
+                // so the recording is written, the marker cleared, and the
+                // pipeline kicked off identically however it was ended.
+                match stop_recording(
+                    app_for_callback.state::<RecordingState>(),
+                    app_for_callback.state::<EnginesState>(),
+                    app_for_callback.state::<AppPaths>(),
+                    app_for_callback.state::<AutoRecordingState>(),
+                ) {
+                    Ok(result) => println!("silence monitor: stopped on request — meeting_id={}", result.meeting_id),
+                    Err(e) => eprintln!("silence monitor: failed to stop the recording: {e}"),
+                }
+            } else {
+                // ISC-204: "Continue" (or a dismissed dialog) requires a
+                // fresh, full continuous silence window before this can
+                // fire again — never an immediate re-prompt on the next
+                // 5-second check.
+                println!("silence monitor: continuing — a fresh silence window is required before asking again");
+                if let Ok(mut tracker) = app_for_callback.state::<SilenceTrackerState>().0.lock() {
+                    tracker.reset();
+                }
+            }
+            dialog_open.store(false, Ordering::SeqCst);
+        });
+}
+
+/// The silence run-length tracker, in managed state so the dialog's
+/// callback (which runs on the UI thread, not the monitor loop) can reset
+/// it directly when the user chooses "Continue".
+#[derive(Default)]
+struct SilenceTrackerState(Mutex<silence_monitor::SilenceTracker>);
+
+#[derive(serde::Serialize)]
+struct AutoJoinLogEntry {
+    event_id: String,
+    subject: String,
+    /// Unix seconds — formatted for display by the frontend.
+    triggered_at: i64,
+}
+
+#[tauri::command]
+fn set_auto_join_enabled(enabled: bool, paths: State<AppPaths>) -> Result<(), String> {
+    let db_path = paths.data_dir.join("kai-notetaker.sqlite3");
+    let conn = storage::open_connection(&db_path).map_err(|e| e.to_string())?;
+    storage::ensure_schema(&conn).map_err(|e| e.to_string())?;
+    storage::set_auto_join_enabled(&conn, enabled).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn get_auto_join_enabled(paths: State<AppPaths>) -> Result<bool, String> {
+    let db_path = paths.data_dir.join("kai-notetaker.sqlite3");
+    let conn = storage::open_connection(&db_path).map_err(|e| e.to_string())?;
+    storage::ensure_schema(&conn).map_err(|e| e.to_string())?;
+    storage::get_auto_join_enabled(&conn).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn list_auto_joined_meetings(paths: State<AppPaths>) -> Result<Vec<AutoJoinLogEntry>, String> {
+    let db_path = paths.data_dir.join("kai-notetaker.sqlite3");
+    let conn = storage::open_connection(&db_path).map_err(|e| e.to_string())?;
+    storage::ensure_schema(&conn).map_err(|e| e.to_string())?;
+    Ok(storage::list_auto_joined(&conn)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(|(event_id, triggered_at, subject)| AutoJoinLogEntry { event_id, subject, triggered_at })
+        .collect())
 }
 
 #[tauri::command]
@@ -467,8 +888,14 @@ fn label_transcript_segments(
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        // Native OS message dialogs, for the silence-based Stop/Continue
+        // prompt (ISC-202). Registered exactly as the plugin's own v2 docs
+        // specify.
+        .plugin(tauri_plugin_dialog::init())
         .manage(RecordingState::default())
         .manage(EnginesState::default())
+        .manage(AutoRecordingState::default())
+        .manage(SilenceTrackerState::default())
         .invoke_handler(tauri::generate_handler![
             list_audio_devices,
             start_recording,
@@ -486,7 +913,14 @@ pub fn run() {
             reprocess_meeting_with_speaker_count,
             connect_microsoft_calendar,
             is_microsoft_calendar_connected,
-            list_upcoming_meetings
+            connect_google_calendar,
+            is_google_calendar_connected,
+            connect_zoom,
+            is_zoom_connected,
+            list_upcoming_meetings,
+            set_auto_join_enabled,
+            get_auto_join_enabled,
+            list_auto_joined_meetings
         ])
         .setup(|app| {
             let data_dir = app
@@ -543,6 +977,58 @@ pub fn run() {
                         Ok(_) => {}
                         Err(e) => eprintln!("retention sweep failed: {e}"),
                     }
+                }
+            });
+
+            // AutoJoinRecording's poller — same shape as the retention
+            // sweep above (own DB connection per cycle, catch-and-log,
+            // never panic), just on a 60-second interval and spawned
+            // unconditionally so it keeps running whichever tab is open
+            // (ISC-167). The cycle body itself is genuinely blocking (a
+            // real Graph HTTP call plus SQLite), so it runs on the
+            // blocking pool rather than stalling an async worker for the
+            // length of a network round trip.
+            let auto_join_handle = app.handle().clone();
+            let auto_join_db_path = data_dir.join("kai-notetaker.sqlite3");
+            tauri::async_runtime::spawn(async move {
+                let mut interval =
+                    tokio::time::interval(std::time::Duration::from_secs(auto_join::POLL_INTERVAL_SECS));
+                loop {
+                    interval.tick().await;
+                    let app_handle = auto_join_handle.clone();
+                    let db_path = auto_join_db_path.clone();
+                    if let Err(e) = tauri::async_runtime::spawn_blocking(move || {
+                        run_auto_join_cycle(&app_handle, &db_path)
+                    })
+                    .await
+                    {
+                        eprintln!("auto-join: poll cycle task failed: {e}");
+                    }
+                }
+            });
+
+            // SilenceBasedStopPrompt's monitor — a SEPARATE loop from the
+            // auto-join poller above, on a much finer interval (ISC-201).
+            // The two never gate each other: ISC-181's calendar-end
+            // auto-stop still runs in the poll cycle and still stops
+            // silently and directly when a scheduled end passes, while
+            // this loop is the independent, lower-confidence layer for
+            // calls that end earlier or later than the calendar said
+            // (ISC-206).
+            //
+            // Each tick is cheap and non-blocking (one buffer read, no
+            // network, no SQLite), so unlike the auto-join cycle it does
+            // not need the blocking pool.
+            let silence_handle = app.handle().clone();
+            let dialog_open = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            tauri::async_runtime::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+                    silence_monitor::CHECK_INTERVAL_SECS,
+                ));
+                loop {
+                    interval.tick().await;
+                    let tracker = silence_handle.state::<SilenceTrackerState>();
+                    silence_monitor_tick(&silence_handle, &tracker.0, &dialog_open);
                 }
             });
 

@@ -215,6 +215,15 @@ pub fn ensure_schema(conn: &Connection) -> Result<(), StorageError> {
             label TEXT NOT NULL,
             FOREIGN KEY(segment_id) REFERENCES transcript_segments(id),
             FOREIGN KEY(known_speaker_id) REFERENCES known_speakers(id)
+         );
+         CREATE TABLE IF NOT EXISTS auto_join_log (
+            event_id TEXT PRIMARY KEY,
+            triggered_at INTEGER NOT NULL,
+            subject TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
          );",
     )?;
     apply_column_migrations(conn)?;
@@ -634,6 +643,78 @@ pub fn get_meeting_detail(conn: &Connection, meeting_id: i64) -> Result<MeetingD
     })
 }
 
+// ---------------------------------------------------------------------
+// Settings + auto-join log
+//
+// `settings` is a deliberately generic key/value table rather than a
+// column-per-setting: this app had no settings mechanism at all before
+// AutoJoinRecording (checked before adding one), and a k/v table means
+// the next boolean/small-string preference is an INSERT, not a schema
+// migration on a database that now holds real client recordings.
+// ---------------------------------------------------------------------
+
+const AUTO_JOIN_ENABLED_KEY: &str = "auto_join_enabled";
+
+pub fn get_setting(conn: &Connection, key: &str) -> Result<Option<String>, StorageError> {
+    let mut stmt = conn.prepare("SELECT value FROM settings WHERE key = ?1")?;
+    let mut rows = stmt.query([key])?;
+    match rows.next()? {
+        Some(row) => Ok(Some(row.get(0)?)),
+        None => Ok(None),
+    }
+}
+
+pub fn set_setting(conn: &Connection, key: &str, value: &str) -> Result<(), StorageError> {
+    conn.execute(
+        "INSERT INTO settings (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        rusqlite::params![key, value],
+    )?;
+    Ok(())
+}
+
+/// Absent row means OFF. This is the load-bearing default for ISC-164:
+/// a fresh install — or a fresh Microsoft connection on an existing
+/// install — must never auto-open a browser tab and start recording
+/// until Jeremiah explicitly opts in. Anything other than the exact
+/// string `"true"` is treated as off, so a corrupted/hand-edited value
+/// fails closed rather than silently enabling background recording.
+pub fn get_auto_join_enabled(conn: &Connection) -> Result<bool, StorageError> {
+    Ok(get_setting(conn, AUTO_JOIN_ENABLED_KEY)?.as_deref() == Some("true"))
+}
+
+pub fn set_auto_join_enabled(conn: &Connection, enabled: bool) -> Result<(), StorageError> {
+    set_setting(conn, AUTO_JOIN_ENABLED_KEY, if enabled { "true" } else { "false" })
+}
+
+/// `INSERT OR IGNORE`, not `INSERT OR REPLACE`: the row IS the
+/// idempotency record, so re-logging the same event must preserve the
+/// original `triggered_at` rather than sliding it forward on every poll.
+pub fn log_auto_join(conn: &Connection, event_id: &str, subject: &str) -> Result<(), StorageError> {
+    conn.execute(
+        "INSERT OR IGNORE INTO auto_join_log (event_id, triggered_at, subject) VALUES (?1, ?2, ?3)",
+        rusqlite::params![event_id, chrono::Utc::now().timestamp(), subject],
+    )?;
+    Ok(())
+}
+
+pub fn was_already_auto_joined(conn: &Connection, event_id: &str) -> Result<bool, StorageError> {
+    let count: i64 = conn.query_row(
+        "SELECT count(*) FROM auto_join_log WHERE event_id = ?1",
+        [event_id],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+/// `(event_id, triggered_at unix seconds, subject)`, most recent first.
+pub fn list_auto_joined(conn: &Connection) -> Result<Vec<(String, i64, String)>, StorageError> {
+    let mut stmt = conn
+        .prepare("SELECT event_id, triggered_at, subject FROM auto_join_log ORDER BY triggered_at DESC")?;
+    let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(StorageError::from)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1039,5 +1120,73 @@ mod tests {
 
         let names: Vec<String> = list_known_speakers(&conn).unwrap().into_iter().map(|(_, n)| n).collect();
         assert_eq!(names, vec!["Dave", "Jeremiah", "Nesta"]);
+    }
+
+    /// ISC-160: the idempotency record must be a real persisted row, not
+    /// an in-memory `HashSet` that resets on relaunch — otherwise every
+    /// app restart re-opens and re-records meetings it already handled.
+    /// Deliberately a real on-disk file (not `open_in_memory`) closed and
+    /// reopened, because an in-memory database cannot distinguish "we
+    /// persisted it" from "it never left RAM".
+    #[test]
+    fn auto_join_log_persists_across_reconnect() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db_path = tmp.path().to_path_buf();
+
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            ensure_schema(&conn).unwrap();
+            log_auto_join(&conn, "AAMkAGI2TG93AAA=_ScopingCall", "Smithville PCI-DSS Scoping Call").unwrap();
+            assert!(was_already_auto_joined(&conn, "AAMkAGI2TG93AAA=_ScopingCall").unwrap());
+        } // connection dropped — simulates the app quitting
+
+        let conn = Connection::open(&db_path).unwrap();
+        ensure_schema(&conn).unwrap();
+        assert!(
+            was_already_auto_joined(&conn, "AAMkAGI2TG93AAA=_ScopingCall").unwrap(),
+            "a meeting already auto-joined before a restart must still count as auto-joined after it"
+        );
+        assert!(!was_already_auto_joined(&conn, "some-other-event-id").unwrap());
+
+        let logged = list_auto_joined(&conn).unwrap();
+        assert_eq!(logged.len(), 1);
+        assert_eq!(logged[0].0, "AAMkAGI2TG93AAA=_ScopingCall");
+        assert_eq!(logged[0].2, "Smithville PCI-DSS Scoping Call");
+        assert!(logged[0].1 > 0, "triggered_at must be a real unix timestamp");
+    }
+
+    /// ISC-160 (second half): re-logging the same event must not slide
+    /// `triggered_at` forward — the row is the idempotency record, so
+    /// the timestamp has to mean "when we FIRST auto-joined this".
+    #[test]
+    fn log_auto_join_is_idempotent_and_preserves_the_first_trigger_time() {
+        let conn = test_db();
+        log_auto_join(&conn, "event-1", "First Subject").unwrap();
+        let first = list_auto_joined(&conn).unwrap();
+
+        log_auto_join(&conn, "event-1", "A Renamed Subject").unwrap();
+        let after = list_auto_joined(&conn).unwrap();
+
+        assert_eq!(after.len(), 1, "logging the same event twice must not create a second row");
+        assert_eq!(after[0].1, first[0].1, "the original triggered_at must be preserved");
+        assert_eq!(after[0].2, "First Subject");
+    }
+
+    /// ISC-164: OFF by default. A fresh database — a fresh install — must
+    /// report the toggle as false with no row present at all.
+    #[test]
+    fn auto_join_is_disabled_by_default_on_a_fresh_database() {
+        let conn = test_db();
+        assert!(get_setting(&conn, "auto_join_enabled").unwrap().is_none(), "no row should exist yet");
+        assert!(!get_auto_join_enabled(&conn).unwrap(), "auto-join must default to OFF");
+
+        set_auto_join_enabled(&conn, true).unwrap();
+        assert!(get_auto_join_enabled(&conn).unwrap());
+        set_auto_join_enabled(&conn, false).unwrap();
+        assert!(!get_auto_join_enabled(&conn).unwrap());
+
+        // Fails closed: anything that isn't exactly "true" is off.
+        set_setting(&conn, "auto_join_enabled", "yes-please").unwrap();
+        assert!(!get_auto_join_enabled(&conn).unwrap(), "a non-\"true\" value must fail closed to OFF");
     }
 }

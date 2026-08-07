@@ -50,6 +50,7 @@ base64 = "0.22"
 # since oauth connect flows need to open the provider's sign-in page in
 # the user's default browser without going through a Tauri command/AppHandle.
 open = "5.4.0"
+tauri-plugin-dialog = "2"
 
 [dev-dependencies]
 tempfile = "3"

@@ -8,6 +8,15 @@
   margin-bottom: var(--space-3);
 }
 
+/* One block per connectable provider (Microsoft / Google / Zoom). Rule
+   separators rather than boxes, so three stacked sections read as one
+   settings list instead of three competing panels. */
+.calendar-settings__provider {
+  padding-bottom: var(--space-4);
+  margin-bottom: var(--space-4);
+  border-bottom: 1px solid var(--color-border);
+}
+
 .calendar-settings__hint {
   font-size: 13px;
   color: var(--color-text-secondary);
@@ -40,6 +49,62 @@
 .calendar-settings__status {
   color: var(--color-accent);
   font-weight: 600;
+}
+
+.calendar-settings__auto-join {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+}
+
+.calendar-settings__auto-join-toggle {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--color-text-primary);
+  cursor: pointer;
+}
+
+.calendar-settings__auto-join .calendar-settings__hint {
+  margin-bottom: 0;
+}
+
+.calendar-settings__auto-join-log-heading {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--color-text-secondary);
+  margin-top: var(--space-2);
+}
+
+.calendar-settings__auto-join-log {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.calendar-settings__auto-join-log-item {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--space-3);
+  font-size: 12px;
+}
+
+.calendar-settings__auto-join-log-subject {
+  color: var(--color-text-primary);
+}
+
+.calendar-settings__auto-join-log-time {
+  color: var(--color-text-secondary);
+  white-space: nowrap;
 }
 
 .calendar-settings__window {
