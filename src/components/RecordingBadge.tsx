@@ -29,6 +29,18 @@ const POLL_MS = 500;
 export function RecordingBadge() {
   const [elapsed, setElapsed] = useState<number | null>(null);
 
+  // Both windows load the same CSS bundle (see main.tsx), so a bare
+  // `body { background: transparent }` in RecordingBadge.css would leak
+  // into the main window's own document too, overriding the real theme —
+  // a real bug this exact scoping caught and fixed. Marking only THIS
+  // window's own <html> confines the override to a document the main
+  // window's React tree never touches (each Tauri window is a fully
+  // separate document, not a shared DOM).
+  useEffect(() => {
+    document.documentElement.classList.add("recording-badge-window");
+    return () => document.documentElement.classList.remove("recording-badge-window");
+  }, []);
+
   useEffect(() => {
     let cancelled = false;
 

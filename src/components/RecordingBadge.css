@@ -2,10 +2,17 @@
  * The overlay window is undecorated, so this element IS the whole visible
  * surface — it draws its own background, radius, and border rather than
  * sitting inside an app shell.
+ *
+ * Scoped to `.recording-badge-window` (set on <html> only by RecordingBadge
+ * itself, see RecordingBadge.tsx) rather than bare html/body/#root — both
+ * Tauri windows load the same CSS bundle, and an unscoped rule here would
+ * override the main window's real theme background with `transparent`,
+ * leaving default-white behind light-on-dark theme text. Confirmed this
+ * exact failure live (2026-08-07) before scoping it.
  */
-html,
-body,
-#root {
+html.recording-badge-window,
+html.recording-badge-window body,
+html.recording-badge-window #root {
   margin: 0;
   padding: 0;
   height: 100%;
