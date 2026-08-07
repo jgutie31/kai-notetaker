@@ -1,8 +1,8 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Capability for the main window",
-  "windows": ["main"],
+  "description": "Capability for the main window and the recording indicator overlay",
+  "windows": ["main", "recording-badge"],
   "permissions": [
     "core:default",
     "opener:default"

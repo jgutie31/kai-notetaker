@@ -123,6 +123,46 @@ pub fn should_auto_stop(marker_end: DateTime<Utc>, now: DateTime<Utc>) -> bool {
     now > marker_end
 }
 
+/// Which stop signal governs an auto-started recording (ISC-233).
+///
+/// Exists because a presence-triggered ad-hoc recording has no calendar
+/// end-time to stop against — the single-`DateTime` marker shape ISC-181
+/// introduced simply cannot represent that case. Making it an enum rather
+/// than an `Option<DateTime>` is deliberate: `None` would say "no known end"
+/// without saying *what does* end it, and the two stop mechanisms
+/// (calendar-end-time in the 60s poll cycle, presence-leaving in the 15s
+/// presence loop) must never cross-trigger against a recording the other one
+/// owns. The variant names which loop is responsible.
+///
+/// Lives here, next to `should_auto_stop`, rather than beside the marker
+/// struct in `lib.rs`: both this module and `presence` reason about it in
+/// pure, unit-tested code, and neither should have to reach up into the
+/// Tauri-bound crate root to do it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AutoStopTrigger {
+    /// The meeting's real end time, parsed once at trigger time. Owned by
+    /// the calendar poll cycle (ISC-181).
+    CalendarEnd(DateTime<Utc>),
+    /// No fixed end exists. Owned entirely by the presence poll loop, which
+    /// stops the recording when presence leaves the in-call state
+    /// (ISC-234). The calendar cycle must not apply any time check to this
+    /// variant — there is no time to check against.
+    PresenceBased,
+}
+
+impl AutoStopTrigger {
+    /// Whether the *calendar* poll cycle should stop this recording at
+    /// `now`. Always false for `PresenceBased`: that variant's stop
+    /// condition belongs to the presence loop alone, and a time-based check
+    /// here would either never fire or fire arbitrarily.
+    pub fn calendar_auto_stop_due(&self, now: DateTime<Utc>) -> bool {
+        match self {
+            AutoStopTrigger::CalendarEnd(end) => should_auto_stop(*end, now),
+            AutoStopTrigger::PresenceBased => false,
+        }
+    }
+}
+
 pub fn eligibility(meeting: &UpcomingMeeting, now: DateTime<Utc>) -> Eligibility {
     let Some(start) = parse_graph_utc(&meeting.start) else {
         return Eligibility::UnparseableStart;
@@ -298,6 +338,45 @@ mod tests {
         assert!(!should_auto_stop(end, end - chrono::Duration::seconds(1)), "one second before end: not yet");
         assert!(!should_auto_stop(end, end), "exactly at end: not yet — still their last second");
         assert!(should_auto_stop(end, end + chrono::Duration::seconds(1)), "one second past end: stop it");
+    }
+
+    /// ISC-233: the `CalendarEnd` variant preserves ISC-181's behavior
+    /// exactly — same boundary, same strictness. Asserted against
+    /// `should_auto_stop` directly so a future edit to one and not the other
+    /// fails here rather than silently changing when scheduled recordings
+    /// stop.
+    #[test]
+    fn the_calendar_end_variant_preserves_isc_181s_exact_stop_boundary() {
+        let end = "2026-08-10T15:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let marker = AutoStopTrigger::CalendarEnd(end);
+        assert!(!marker.calendar_auto_stop_due(end - chrono::Duration::seconds(1)));
+        assert!(!marker.calendar_auto_stop_due(end), "exactly at end: still their last second");
+        assert!(marker.calendar_auto_stop_due(end + chrono::Duration::seconds(1)));
+
+        for offset in [-3600, -1, 0, 1, 3600] {
+            let now = end + chrono::Duration::seconds(offset);
+            assert_eq!(
+                marker.calendar_auto_stop_due(now),
+                should_auto_stop(end, now),
+                "the enum wrapper must never diverge from should_auto_stop"
+            );
+        }
+    }
+
+    /// ISC-233/ISC-234's other half: the calendar cycle must apply NO time
+    /// check to a presence-triggered recording, at any point on the
+    /// timeline. If this ever returned true, an ad-hoc call would be cut off
+    /// by a loop that has no idea whether it's still running.
+    #[test]
+    fn the_presence_based_variant_is_never_stopped_by_the_calendar_cycle() {
+        let marker = AutoStopTrigger::PresenceBased;
+        let base = "2026-08-10T15:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        for offset in [-86_400, -1, 0, 1, 86_400] {
+            assert!(
+                !marker.calendar_auto_stop_due(base + chrono::Duration::seconds(offset)),
+                "presence-based recordings are the presence loop's job alone"
+            );
+        }
     }
 
     /// Graph's real, offset-less UTC shape: seven fractional-second

@@ -17,6 +17,7 @@ pub mod llm;
 pub mod model_provisioning;
 mod oauth;
 pub mod pipeline;
+mod presence;
 mod retention;
 mod silence_monitor;
 pub mod speaker_id;
@@ -50,9 +51,11 @@ struct AutoRecordingState(Mutex<Option<AutoRecordingMarker>>);
 
 struct AutoRecordingMarker {
     subject: String,
-    /// The meeting's real end time — parsed once at trigger time so the
-    /// stop check never has to re-fetch or re-parse anything.
-    end: chrono::DateTime<chrono::Utc>,
+    /// Which loop owns ending this recording, and on what signal (ISC-233).
+    /// A scheduled meeting carries its real end time, parsed once at trigger
+    /// time so the stop check never re-fetches or re-parses. An ad-hoc Teams
+    /// call has no end time at all — presence itself ends it.
+    stop_trigger: auto_join::AutoStopTrigger,
 }
 
 /// The four heavy local models, loaded once in a background OS thread at
@@ -133,6 +136,74 @@ fn list_audio_devices() -> Result<Vec<audio_capture::InputDeviceInfo>, String> {
     audio_capture::list_input_devices().map_err(|e| e.to_string())
 }
 
+/// The overlay indicator window's label. Referenced in exactly three places:
+/// the one `WebviewWindowBuilder::new` call in `.setup()`, the one lookup in
+/// `set_recording_badge_visible`, and the frontend's own
+/// `getCurrentWindow().label` check (ISC-242) — which is why it's a constant
+/// and not three string literals that can drift apart.
+const RECORDING_BADGE_LABEL: &str = "recording-badge";
+
+/// The overlay's fixed logical size — small enough to be a status indicator
+/// rather than a window, wide enough for "Recording" plus a `MM:SS` timer
+/// without truncating. Fixed for v1; draggable/resizable/configurable is
+/// explicitly out of scope.
+const RECORDING_BADGE_SIZE: (f64, f64) = (176.0, 44.0);
+
+/// Inset from the screen edge, matching the breathing room macOS's own
+/// screen-recording indicator leaves.
+const RECORDING_BADGE_MARGIN: f64 = 24.0;
+
+/// Top-right corner placement, in logical pixels, from the primary monitor's
+/// logical size (ISC-238).
+///
+/// Computed rather than hardcoded because a fixed x-coordinate is a real
+/// off-screen hazard, not a hypothetical one: any constant tuned for one
+/// display puts the badge partly or entirely off the edge of a narrower one,
+/// and an indicator you cannot see fails the single job it exists to do.
+///
+/// `None` — Tauri could not resolve a primary monitor — falls back to a
+/// conservative 1280-wide assumption, which lands on-screen for every common
+/// display and merely looks off-center on a wide one. Erring toward visible
+/// is the whole point.
+///
+/// Pure and unit-tested for exactly that reason: the arithmetic is trivial,
+/// but getting it wrong is silent, and only observable by launching the app
+/// on a specific monitor.
+fn recording_badge_position(monitor_logical_size: Option<(f64, f64)>) -> (f64, f64) {
+    const FALLBACK_WIDTH: f64 = 1280.0;
+    let width = match monitor_logical_size {
+        Some((w, _)) if w > 0.0 => w,
+        _ => FALLBACK_WIDTH,
+    };
+    let x = (width - RECORDING_BADGE_SIZE.0 - RECORDING_BADGE_MARGIN).max(0.0);
+    (x, RECORDING_BADGE_MARGIN)
+}
+
+/// Shows or hides the always-on-top recording indicator (ISC-240).
+///
+/// The ONE place overlay visibility changes. Called from `start_recording`
+/// and `stop_recording` — the two functions every trigger already funnels
+/// through (manual button, calendar auto-start, silence-prompt stop, and now
+/// presence auto-start/stop), per the same "one real call site" precedent as
+/// ISC-171/ISC-203. A fifth trigger added later gets the indicator for free
+/// and cannot forget to.
+///
+/// Every failure here is logged and swallowed. Deliberate: this is a status
+/// indicator, and a window that won't show must never be the reason a real
+/// meeting fails to record. The recording is the product; the badge is the
+/// signal about it.
+fn set_recording_badge_visible(app: &tauri::AppHandle, visible: bool) {
+    let Some(window) = app.get_webview_window(RECORDING_BADGE_LABEL) else {
+        eprintln!("recording badge: window '{RECORDING_BADGE_LABEL}' not found — indicator not updated");
+        return;
+    };
+    let result = if visible { window.show() } else { window.hide() };
+    if let Err(e) = result {
+        let action = if visible { "show" } else { "hide" };
+        eprintln!("recording badge: failed to {action} the indicator: {e}");
+    }
+}
+
 #[tauri::command]
 fn start_recording(app: tauri::AppHandle, state: State<RecordingState>) -> Result<(), String> {
     let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
@@ -146,6 +217,11 @@ fn start_recording(app: tauri::AppHandle, state: State<RecordingState>) -> Resul
         return Err("a recording is already in progress".to_string());
     }
     *guard = Some((session, Instant::now()));
+
+    // Only after the capture is genuinely live and committed to state — the
+    // badge must never claim a recording that an early return above
+    // prevented (ISC-243).
+    set_recording_badge_visible(&app, true);
     Ok(())
 }
 
@@ -163,8 +239,29 @@ struct StopRecordingResult {
     meeting_id: i64,
 }
 
+/// Elapsed seconds on the live recording, or `None` when nothing is
+/// recording (ISC-241).
+///
+/// Elapsed is computed here rather than handing the frontend a start
+/// timestamp to subtract from: the source of truth is the same monotonic
+/// `Instant` `stop_recording` bills the real duration against, so the badge
+/// can never drift from the saved recording's length, and a wall-clock jump
+/// (sleep/wake, NTP correction) can't make the badge count backwards.
+#[derive(serde::Serialize)]
+struct RecordingStatusPayload {
+    elapsed_secs: u64,
+}
+
+#[tauri::command]
+fn recording_status(state: State<RecordingState>) -> Option<RecordingStatusPayload> {
+    let guard = state.0.lock().ok()?;
+    let (_, started_at) = guard.as_ref()?;
+    Some(RecordingStatusPayload { elapsed_secs: started_at.elapsed().as_secs() })
+}
+
 #[tauri::command]
 fn stop_recording(
+    app: tauri::AppHandle,
     state: State<RecordingState>,
     engines_state: State<EnginesState>,
     paths: State<AppPaths>,
@@ -174,6 +271,11 @@ fn stop_recording(
     let (session, started_at) = guard.take().ok_or("no recording in progress")?;
     let elapsed = started_at.elapsed().as_secs();
     let path = session.stop_and_write().map_err(|e| e.to_string())?;
+
+    // The recording is over the moment the capture is torn down — hide the
+    // indicator before the (much longer) pipeline work below, so the badge
+    // tracks "is the mic live", not "is the app busy" (ISC-243).
+    set_recording_badge_visible(&app, false);
 
     // Clear the auto-recording marker on ANY stop — manual click or
     // auto-stop — so a manually-stopped auto-triggered meeting doesn't
@@ -415,11 +517,16 @@ fn run_auto_join_cycle(app: &tauri::AppHandle, db_path: &std::path::Path) {
     // box mid-meeting; leaving a mic capturing indefinitely is exactly the
     // real risk he flagged ("make sure there IS an auto-stop when the call
     // ends"). Distinct from the new-trigger path below, which IS gated.
+    //
+    // Marker-variant aware since ISC-233: a `CalendarEnd` marker keeps
+    // exactly ISC-181's behavior, while a `PresenceBased` one is skipped
+    // outright here — it has no end time, and the presence loop owns ending
+    // it. The two stop mechanisms never cross-trigger.
     {
         let due_subject = match app.state::<AutoRecordingState>().0.lock() {
             Ok(guard) => guard
                 .as_ref()
-                .and_then(|m| auto_join::should_auto_stop(m.end, chrono::Utc::now()).then(|| m.subject.clone())),
+                .and_then(|m| m.stop_trigger.calendar_auto_stop_due(chrono::Utc::now()).then(|| m.subject.clone())),
             Err(_) => {
                 eprintln!("auto-join: auto-recording marker lock poisoned — skipping auto-stop check this cycle");
                 None
@@ -427,6 +534,7 @@ fn run_auto_join_cycle(app: &tauri::AppHandle, db_path: &std::path::Path) {
         };
         if let Some(subject) = due_subject {
             match stop_recording(
+                app.clone(),
                 app.state::<RecordingState>(),
                 app.state::<EnginesState>(),
                 app.state::<AppPaths>(),
@@ -517,7 +625,10 @@ fn run_auto_join_cycle(app: &tauri::AppHandle, db_path: &std::path::Path) {
                 // this path ever writes the marker (ISC-181).
                 if let Some(end) = auto_join::parse_graph_utc(&meeting.end) {
                     if let Ok(mut marker_guard) = app.state::<AutoRecordingState>().0.lock() {
-                        *marker_guard = Some(AutoRecordingMarker { subject: meeting.subject.clone(), end });
+                        *marker_guard = Some(AutoRecordingMarker {
+                            subject: meeting.subject.clone(),
+                            stop_trigger: auto_join::AutoStopTrigger::CalendarEnd(end),
+                        });
                     }
                 } else {
                     eprintln!(
@@ -532,6 +643,110 @@ fn run_auto_join_cycle(app: &tauri::AppHandle, db_path: &std::path::Path) {
             if let Err(e) = storage::log_auto_join(&conn, &meeting.id, &meeting.subject) {
                 eprintln!("auto-join: failed to record '{}' in the auto-join log: {e}", meeting.subject);
             }
+        }
+    }
+}
+
+/// One TeamsPresenceAdhocRecording poll cycle: the side-effecting half of
+/// the feature, exactly the shape `run_auto_join_cycle` established. All
+/// three decisions — is Microsoft connected, should this start, should this
+/// stop — are pure functions in `presence`/`auto_join`; this function only
+/// supplies real inputs and carries out the results.
+///
+/// Every failure path logs and returns. Nothing panics or propagates: this
+/// runs forever on a 15-second timer, and a network blip, an expired refresh
+/// token, or consent revoked in the Azure portal must cost one cycle, not
+/// take a live recording down with it (ISC-229's resilience requirement,
+/// same rule as the calendar poller).
+fn run_presence_cycle(app: &tauri::AppHandle) {
+    // ISC-230, before anything else and before any network call: a
+    // disconnected — or half-connected — Microsoft provider produces zero
+    // presence-poll activity. Same predicate the calendar poller uses
+    // (`ProviderConnection::is_active`), not a second copy of the rule, so
+    // the two can't drift on what "connected" means. A Keychain read that
+    // errors counts as not connected: one transient secure-storage hiccup
+    // should cost one cycle, not kill the loop.
+    let connection = auto_join::ProviderConnection {
+        provider_id: calendar::MICROSOFT_PROVIDER_ID,
+        client_id: oauth::load_client_id(calendar::MICROSOFT_PROVIDER_ID).unwrap_or(None),
+        has_tokens: oauth::load_tokens(calendar::MICROSOFT_PROVIDER_ID).map(|t| t.is_some()).unwrap_or(false),
+    };
+    if !connection.is_active() {
+        return;
+    }
+    let Some(client_id) = connection.client_id else { return };
+
+    let access_token = match calendar::microsoft_access_token(&client_id) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("presence: could not obtain a valid access token: {e}");
+            return;
+        }
+    };
+
+    let call_state = match presence::get_presence(&access_token) {
+        Ok(p) => {
+            // Logged verbatim on purpose: this is the exact raw value
+            // ISC-227's [DEFERRED-VERIFY] check needs from Jeremiah's real
+            // Teams client to confirm what "Meet Now" actually produces.
+            // Reading it out of a log beats guessing.
+            println!("presence: availability='{}' activity='{}'", p.availability, p.activity);
+            p.call_state()
+        }
+        Err(e) => {
+            eprintln!("presence: /me/presence poll failed: {e}");
+            return;
+        }
+    };
+
+    let already_recording = match app.state::<RecordingState>().0.lock() {
+        Ok(guard) => guard.is_some(),
+        Err(_) => {
+            eprintln!("presence: recording state lock poisoned — skipping this cycle");
+            return;
+        }
+    };
+
+    if presence::should_start(call_state, already_recording) {
+        // ISC-231: the exact same command function the Start Recording
+        // button and the calendar poller call — not a parallel recording
+        // path — so an ad-hoc capture produces an identical on-disk artifact
+        // and runs the identical downstream pipeline.
+        match start_recording(app.clone(), app.state::<RecordingState>()) {
+            Ok(()) => {
+                println!("presence: detected an ad-hoc Teams call — started recording");
+                if let Ok(mut marker_guard) = app.state::<AutoRecordingState>().0.lock() {
+                    *marker_guard = Some(AutoRecordingMarker {
+                        subject: presence::ADHOC_SUBJECT.to_string(),
+                        stop_trigger: auto_join::AutoStopTrigger::PresenceBased,
+                    });
+                }
+            }
+            Err(e) => eprintln!("presence: failed to start an ad-hoc recording: {e}"),
+        }
+        return;
+    }
+
+    // ISC-234. The marker is read and the decision made under one lock, then
+    // released before `stop_recording` — which takes that same lock to clear
+    // the marker, and `std::sync::Mutex` is not reentrant.
+    let should_stop = match app.state::<AutoRecordingState>().0.lock() {
+        Ok(guard) => presence::should_stop(call_state, guard.as_ref().map(|m| &m.stop_trigger)),
+        Err(_) => {
+            eprintln!("presence: auto-recording marker lock poisoned — skipping the stop check this cycle");
+            return;
+        }
+    };
+    if should_stop {
+        match stop_recording(
+            app.clone(),
+            app.state::<RecordingState>(),
+            app.state::<EnginesState>(),
+            app.state::<AppPaths>(),
+            app.state::<AutoRecordingState>(),
+        ) {
+            Ok(result) => println!("presence: the ad-hoc call ended — auto-stopped, meeting_id={}", result.meeting_id),
+            Err(e) => eprintln!("presence: failed to auto-stop the ad-hoc recording: {e}"),
         }
     }
 }
@@ -647,6 +862,7 @@ fn prompt_stop_or_continue(app: &tauri::AppHandle, dialog_open: Arc<std::sync::a
                 // so the recording is written, the marker cleared, and the
                 // pipeline kicked off identically however it was ended.
                 match stop_recording(
+                    app_for_callback.clone(),
                     app_for_callback.state::<RecordingState>(),
                     app_for_callback.state::<EnginesState>(),
                     app_for_callback.state::<AppPaths>(),
@@ -1072,6 +1288,7 @@ pub fn run() {
             start_recording,
             switch_recording_device,
             stop_recording,
+            recording_status,
             list_meetings,
             get_meeting_detail,
             check_missing_models,
@@ -1109,6 +1326,56 @@ pub fn run() {
             {
                 let conn = storage::open_connection(&db_path).expect("open db at startup");
                 storage::ensure_schema(&conn).expect("create schema at startup");
+            }
+
+            // The recording indicator overlay (ISC-238/ISC-239): built ONCE,
+            // here, hidden — never re-created per recording. `.show()` /
+            // `.hide()` on this same handle is all any later state
+            // transition does, which avoids window-creation cost and the
+            // visible flicker of a fresh window on every start.
+            //
+            // It loads the same `index.html` bundle as the main window and
+            // branches on its own label frontend-side (ISC-242), so there's
+            // no second Vite entry point to keep in sync.
+            //
+            // Verified against the installed tauri 2.11.5 source, not
+            // assumed: every method below exists on `WebviewWindowBuilder`
+            // at this version, including `.visible(false)`, so the window
+            // never flashes on screen before being hidden.
+            //
+            // A failure to build is logged, not fatal: the app must still
+            // record without its status badge.
+            let (badge_x, badge_y) = recording_badge_position(
+                app.primary_monitor().ok().flatten().map(|m| {
+                    let size = m.size().to_logical::<f64>(m.scale_factor());
+                    (size.width, size.height)
+                }),
+            );
+            match tauri::WebviewWindowBuilder::new(
+                app,
+                RECORDING_BADGE_LABEL,
+                tauri::WebviewUrl::App("index.html".into()),
+            )
+            .title("Recording")
+            .inner_size(RECORDING_BADGE_SIZE.0, RECORDING_BADGE_SIZE.1)
+            .position(badge_x, badge_y)
+            .always_on_top(true)
+            .decorations(false)
+            .resizable(false)
+            .visible(false)
+            // Keep it out of the taskbar: it's an indicator, not a window
+            // anyone should try to focus. Documented as a no-op on macOS in
+            // tauri 2.11.5's own source — kept anyway because it's the right
+            // declaration for the Windows build, which is deliberately
+            // untouched for now but will inherit this.
+            .skip_taskbar(true)
+            // The badge draws its own rounded border in CSS; an OS drop
+            // shadow around an undecorated 176x44 window reads as a glitch.
+            .shadow(false)
+            .build()
+            {
+                Ok(_) => println!("recording badge: overlay window created (hidden)"),
+                Err(e) => eprintln!("recording badge: failed to create the overlay window: {e}"),
             }
 
             // Load the four heavy models in a background OS thread so the
@@ -1188,6 +1455,35 @@ pub fn run() {
                 }
             });
 
+            // TeamsPresenceAdhocRecording's poller (ISC-229) — a THIRD,
+            // separate loop, distinct from both the 60s calendar poller
+            // above and the silence monitor below. Deliberately not folded
+            // into the calendar cycle: it runs on a shorter interval (ad-hoc
+            // start latency is felt directly, see
+            // PRESENCE_POLL_INTERVAL_SECS), it must keep polling regardless
+            // of the auto-join enabled toggle's calendar-specific gating,
+            // and its cycle is a single cheap Graph GET with no SQLite at
+            // all.
+            //
+            // Like the calendar cycle it IS genuinely blocking (real HTTP
+            // plus Keychain reads), so it runs on the blocking pool rather
+            // than stalling an async worker for a network round trip.
+            let presence_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+                    presence::PRESENCE_POLL_INTERVAL_SECS,
+                ));
+                loop {
+                    interval.tick().await;
+                    let app_handle = presence_handle.clone();
+                    if let Err(e) =
+                        tauri::async_runtime::spawn_blocking(move || run_presence_cycle(&app_handle)).await
+                    {
+                        eprintln!("presence: poll cycle task failed: {e}");
+                    }
+                }
+            });
+
             // SilenceBasedStopPrompt's monitor — a SEPARATE loop from the
             // auto-join poller above, on a much finer interval (ISC-201).
             // The two never gate each other: ISC-181's calendar-end
@@ -1217,6 +1513,56 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod recording_badge_tests {
+    use super::*;
+
+    /// ISC-238: the badge lands in the top-right, fully on screen, across
+    /// the real display sizes Jeremiah actually uses — the built-in laptop
+    /// panel and an external monitor.
+    #[test]
+    fn the_badge_sits_fully_on_screen_in_the_top_right_of_any_real_display() {
+        for (w, h) in [(1280.0, 800.0), (1440.0, 900.0), (1512.0, 982.0), (1920.0, 1080.0), (3440.0, 1440.0)] {
+            let (x, y) = recording_badge_position(Some((w, h)));
+            assert!(x >= 0.0, "{w}x{h}: never off the left edge");
+            assert!(
+                x + RECORDING_BADGE_SIZE.0 <= w,
+                "{w}x{h}: the badge's right edge ({}) must stay on screen",
+                x + RECORDING_BADGE_SIZE.0
+            );
+            assert_eq!(y, RECORDING_BADGE_MARGIN, "{w}x{h}: inset from the top, not flush");
+            // Genuinely top-RIGHT, not merely on-screen: it must sit in the
+            // right half of the display.
+            assert!(x > w / 2.0, "{w}x{h}: must be a right-corner badge");
+        }
+    }
+
+    /// The fallback path — Tauri could not resolve a primary monitor. Must
+    /// still produce a position that is on-screen for every common display,
+    /// because an invisible indicator is the one failure this feature cannot
+    /// tolerate.
+    #[test]
+    fn an_unresolvable_monitor_falls_back_to_a_position_visible_on_any_real_display() {
+        let (x, y) = recording_badge_position(None);
+        assert_eq!(y, RECORDING_BADGE_MARGIN);
+        assert!(x > 0.0);
+        // The narrowest display this could realistically land on still shows
+        // the whole badge.
+        assert!(x + RECORDING_BADGE_SIZE.0 <= 1280.0, "must fit a 1280-wide screen");
+    }
+
+    /// A degenerate monitor size (a real value Tauri can report on some
+    /// headless/virtual displays) must not produce a negative coordinate.
+    #[test]
+    fn a_degenerate_monitor_size_never_produces_an_offscreen_negative_position() {
+        for size in [Some((0.0, 0.0)), Some((-1.0, -1.0)), Some((100.0, 100.0))] {
+            let (x, y) = recording_badge_position(size);
+            assert!(x >= 0.0, "{size:?} produced a negative x");
+            assert!(y >= 0.0);
+        }
+    }
 }
 
 #[cfg(test)]

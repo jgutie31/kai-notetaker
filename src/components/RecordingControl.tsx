@@ -12,7 +12,13 @@ interface StopRecordingResult {
   duration_secs: number;
 }
 
-function formatElapsed(totalSeconds: number): string {
+/**
+ * Exported (ISC-241) so the overlay badge reuses this exact formatting
+ * rather than growing a second, subtly-different timer — the badge and the
+ * main window show the same recording, so a drift between them would read as
+ * a bug in one of them.
+ */
+export function formatElapsed(totalSeconds: number): string {
   const minutes = Math.floor(totalSeconds / 60);
   const seconds = totalSeconds % 60;
   return `${minutes.toString().padStart(2, "0")}:${seconds.toString().padStart(2, "0")}`;

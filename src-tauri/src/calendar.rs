@@ -35,7 +35,18 @@ fn microsoft_config(client_id: &str) -> OAuthProviderConfig {
         authorize_url: "https://login.microsoftonline.com/common/oauth2/v2.0/authorize".to_string(),
         token_url: "https://login.microsoftonline.com/common/oauth2/v2.0/token".to_string(),
         client_id: client_id.to_string(),
-        scope: "openid profile email offline_access Calendars.Read".to_string(),
+        // `Presence.Read` (added 2026-08-07, ISC-225) rides on this same
+        // connection rather than getting its own OAuth flow — it's the same
+        // Microsoft account, the same consent screen, one more delegated
+        // least-privilege scope. Deliberately NOT `Presence.Read.All` (which
+        // reads *other people's* presence) and not an application-only
+        // permission (which would need admin consent).
+        //
+        // Real consequence, surfaced in the UI rather than silently assumed
+        // (ISC-226): an already-connected account's stored token does not
+        // retroactively gain this scope. Jeremiah has to re-run Connect once
+        // — see `CalendarSettings.tsx`'s Microsoft hint.
+        scope: "openid profile email offline_access Calendars.Read Presence.Read".to_string(),
         extra_authorize_params: vec![],
     }
 }
@@ -157,6 +168,19 @@ pub fn is_microsoft_connected() -> Result<bool, CalendarError> {
     Ok(oauth::load_tokens(MICROSOFT_PROVIDER_ID)?.is_some())
 }
 
+/// A currently-valid Microsoft Graph access token, refreshing transparently
+/// if needed — the same one `list_upcoming_meetings` uses internally.
+///
+/// Exists so `presence.rs` can make its own Graph call against this same
+/// connection without `microsoft_config` (and the tenant/endpoint details it
+/// encodes) leaking out of this module. Presence is not a calendar concept,
+/// so it doesn't belong in here; the *credentials* for the Microsoft
+/// connection are, and this is the seam between the two.
+pub fn microsoft_access_token(client_id: &str) -> Result<String, CalendarError> {
+    let config = microsoft_config(client_id);
+    Ok(oauth::get_valid_access_token(MICROSOFT_PROVIDER_ID, &config)?)
+}
+
 /// Real events for the next `hours_ahead` hours from the user's default
 /// calendar. Refreshes the access token transparently if needed
 /// (`oauth::get_valid_access_token`) — callers never think about token
@@ -267,6 +291,27 @@ mod tests {
         let config = microsoft_config("test-client-id");
         let token = oauth::get_valid_access_token(provider, &config).unwrap();
         assert_eq!(token, "fake-test-access-token");
+    }
+
+    /// ISC-225: both scopes are requested on one connection, space-separated
+    /// in the format Microsoft's token endpoint expects. Asserted as real
+    /// substrings of the real config rather than eyeballed, because a
+    /// dropped `Presence.Read` produces no compile error and no runtime
+    /// error either — just a 403 from `/me/presence` fifteen seconds into
+    /// every ad-hoc call, forever.
+    #[test]
+    fn the_microsoft_scope_requests_both_calendar_and_presence_access() {
+        let config = microsoft_config("any-client-id");
+        assert!(config.scope.contains("Calendars.Read"));
+        assert!(config.scope.contains("Presence.Read"));
+        assert!(config.scope.contains("offline_access"), "refresh tokens must survive the scope change");
+        // Least privilege (ISC-225): the .All variant reads other people's
+        // presence and needs admin consent. It must never creep in.
+        assert!(!config.scope.contains("Presence.Read.All"));
+        assert_eq!(
+            config.scope, "openid profile email offline_access Calendars.Read Presence.Read",
+            "space-separated, exactly the shape the token endpoint parses"
+        );
     }
 
     #[test]

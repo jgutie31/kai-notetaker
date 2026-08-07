@@ -49,7 +49,9 @@ const PROVIDERS: Provider[] = [
     clientIdPlaceholder: "Application (client) ID",
     hint:
       "Paste the Application (client) ID from your Azure App Registration below, then click Connect. Your " +
-      "browser will open Microsoft's real sign-in page — nothing is sent anywhere except directly to Microsoft.",
+      "browser will open Microsoft's real sign-in page — nothing is sent anywhere except directly to Microsoft. " +
+      "Already connected? Reconnect once to enable ad-hoc Teams call detection — this now also requests the " +
+      "Presence.Read permission, and an existing sign-in does not pick up a new permission on its own.",
     missingClientIdError: "Paste the Application (client) ID from your Azure App Registration first.",
   },
   {

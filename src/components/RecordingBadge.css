@@ -1,0 +1,74 @@
+/*
+ * The overlay window is undecorated, so this element IS the whole visible
+ * surface — it draws its own background, radius, and border rather than
+ * sitting inside an app shell.
+ */
+html,
+body,
+#root {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  background: transparent;
+  overflow: hidden;
+}
+
+.recording-badge {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  box-sizing: border-box;
+  height: 100%;
+  width: 100%;
+  padding: 0 12px;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: #1c1c1e;
+  color: #f5f5f7;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  font-size: 13px;
+  line-height: 1;
+  /* The badge is a status readout, not a control — selecting its text or
+     dragging it does nothing useful and only makes it feel broken. */
+  user-select: none;
+  cursor: default;
+}
+
+.recording-badge__dot {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: #ff453a;
+  animation: recording-badge-pulse 2s ease-in-out infinite;
+}
+
+.recording-badge__label {
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+
+.recording-badge__timer {
+  margin-left: auto;
+  /* Tabular figures so the timer doesn't jitter horizontally each second. */
+  font-variant-numeric: tabular-nums;
+  color: #a1a1a6;
+}
+
+@keyframes recording-badge-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+/* Respect the OS setting — a pulsing dot pinned on top of everything is
+   exactly the kind of persistent motion this preference exists to stop. */
+@media (prefers-reduced-motion: reduce) {
+  .recording-badge__dot {
+    animation: none;
+  }
+}
