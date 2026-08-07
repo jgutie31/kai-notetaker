@@ -9,3 +9,12 @@
 # machine running real models rather than mocks.
 [env]
 RUST_TEST_THREADS = "1"
+# llama-cpp-sys-2 and whisper-rs-sys vendor ggml's own CMake build, which
+# leaves CMAKE_OSX_DEPLOYMENT_TARGET unset. Both build.rs scripts forward
+# any CMAKE_-prefixed env var straight to CMake (grep "CMAKE_" in either
+# build.rs) — MACOSX_DEPLOYMENT_TARGET alone does NOT reach them, since it
+# doesn't match that prefix. Unset, the Command Line Tools SDK's libc++
+# marks std::filesystem::path (used by ggml-backend-reg.cpp's fs::u8path
+# call) unavailable below macOS 10.15, breaking `cargo build --release`
+# (confirmed 2026-08-07: `tauri build` failed on this in both crates).
+CMAKE_OSX_DEPLOYMENT_TARGET = "13.0"
