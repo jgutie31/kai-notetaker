@@ -245,14 +245,11 @@ fn process_meeting_inner(
         }
     }
 
-    let title: String = summary
-        .meeting_summary
-        .split_whitespace()
-        .take(6)
-        .collect::<Vec<_>>()
-        .join(" ");
-    let title = if title.is_empty() { "Untitled meeting".to_string() } else { title };
-    storage::mark_meeting_ready(conn, meeting_id, &title)?;
+    // ISC-259: the pipeline no longer names anything. The meeting was
+    // titled at creation — with the calendar event's real subject when one
+    // existed, otherwise with a deterministic fallback — so all that is
+    // left to do here is flip the status.
+    storage::mark_meeting_ready(conn, meeting_id)?;
 
     audit.append(
         "meeting_processed",
@@ -332,7 +329,7 @@ mod tests {
 
         let conn = Connection::open_in_memory().unwrap();
         storage::ensure_schema(&conn).unwrap();
-        let meeting_id = storage::create_meeting(&conn, fixture.to_str().unwrap(), 3, storage::TriggerSource::Manual).unwrap();
+        let meeting_id = storage::create_meeting(&conn, fixture.to_str().unwrap(), 3, storage::TriggerSource::Manual, None).unwrap();
 
         let audit_tmp = NamedTempFile::new().unwrap();
         std::fs::remove_file(audit_tmp.path()).ok();
@@ -396,7 +393,7 @@ mod tests {
 
         // First meeting: nobody enrolled yet, so this must fall back to
         // "Speaker N" everywhere, not silently guess a name.
-        let meeting_1 = storage::create_meeting(&conn, fixture.to_str().unwrap(), 3, storage::TriggerSource::Manual).unwrap();
+        let meeting_1 = storage::create_meeting(&conn, fixture.to_str().unwrap(), 3, storage::TriggerSource::Manual, None).unwrap();
         process_meeting(&conn, &audit, &engines, meeting_1, &fixture, None).unwrap();
         let detail_1 = storage::get_meeting_detail(&conn, meeting_1).unwrap();
         let first_speaker_index = detail_1.transcript.iter().find_map(|s| s.speaker).expect("expected at least one diarized speaker");
@@ -417,7 +414,7 @@ mod tests {
 
         // Second meeting, same voice: should now auto-resolve with zero
         // manual labeling.
-        let meeting_2 = storage::create_meeting(&conn, fixture.to_str().unwrap(), 3, storage::TriggerSource::Manual).unwrap();
+        let meeting_2 = storage::create_meeting(&conn, fixture.to_str().unwrap(), 3, storage::TriggerSource::Manual, None).unwrap();
         process_meeting(&conn, &audit, &engines, meeting_2, &fixture, None).unwrap();
         let detail_2 = storage::get_meeting_detail(&conn, meeting_2).unwrap();
         assert!(
@@ -436,7 +433,7 @@ mod tests {
     fn failed_step_marks_meeting_failed_not_stuck_processing() {
         let conn = Connection::open_in_memory().unwrap();
         storage::ensure_schema(&conn).unwrap();
-        let meeting_id = storage::create_meeting(&conn, "/nonexistent/path.wav", 10, storage::TriggerSource::Manual).unwrap();
+        let meeting_id = storage::create_meeting(&conn, "/nonexistent/path.wav", 10, storage::TriggerSource::Manual, None).unwrap();
 
         let audit_tmp = NamedTempFile::new().unwrap();
         std::fs::remove_file(audit_tmp.path()).ok();

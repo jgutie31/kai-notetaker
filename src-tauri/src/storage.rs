@@ -326,20 +326,95 @@ pub struct MeetingListItem {
     pub trigger_source: Option<TriggerSource>,
 }
 
+/// The exact shape SQLite's own `datetime('now')` produces, and the shape
+/// every reader in this codebase already expects from `meetings.created_at`
+/// (UTC, no timezone suffix — `MeetingLibrary.tsx`'s `formatDate` appends
+/// the "Z" itself). `create_meeting` now formats this value in Rust rather
+/// than letting SQLite generate it, so the stored timestamp and the
+/// fallback title's timestamp are provably the same instant — but the
+/// format is unchanged, so nothing downstream can tell the difference.
+const SQLITE_DATETIME_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
+
+/// Deterministic name for a recording that has no real title to inherit
+/// (ISC-263). Same inputs, same string, no DB, no LLM — which is the
+/// entire point. The old behavior derived a title from the first six
+/// words of an LLM summary, which meant a meeting had no name at all
+/// until minutes of pipeline work finished, and then got a name that was
+/// frequently unrelated to the call.
+///
+/// `created_at` is UTC (matches the column it came from); the displayed
+/// stamp is converted to the system's local time before formatting, so it
+/// agrees with `MeetingLibrary.tsx`'s own local-time date column instead
+/// of contradicting it on the same row.
+///
+/// `Calendar` is not one of the three trigger sources this is specified
+/// for — a calendar recording is supposed to arrive with the event's real
+/// subject. Reaching here with `Calendar` means that subject was missing
+/// or blank, so it gets the same neutral label as a manual recording:
+/// claiming "Ad Hoc Call" or inventing a calendar-ish name would be
+/// asserting something we do not actually know.
+pub fn fallback_title(trigger_source: TriggerSource, created_at: &str) -> String {
+    let label = match trigger_source {
+        TriggerSource::Manual | TriggerSource::Calendar => "Recording",
+        TriggerSource::Presence => "Ad Hoc Call",
+        TriggerSource::Recovered => "Recovered Recording",
+    };
+
+    // An unparseable timestamp degrades to the raw stored string rather
+    // than panicking or silently producing a wrong date — a badly-named
+    // meeting is recoverable (rename exists), a crash in the recording
+    // stop path is not.
+    let stamp = chrono::NaiveDateTime::parse_from_str(created_at, SQLITE_DATETIME_FORMAT)
+        .map(|dt| {
+            chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(dt, chrono::Utc)
+                .with_timezone(&chrono::Local)
+                .format("%b %-d, %Y %-I:%M %p")
+                .to_string()
+        })
+        .unwrap_or_else(|_| created_at.to_string());
+
+    format!("{label} — {stamp}")
+}
+
 /// `trigger_source` is a required parameter, not an `Option` with a
 /// default (ISC-246): every caller must state how the recording it is
 /// persisting actually started. Rust has no default arguments, so a new
 /// recording path that forgets to say is a compile error, not a row
 /// quietly mislabeled `manual`.
+///
+/// `known_title` (ISC-258) is the real, already-known name of the thing
+/// being recorded — in practice a calendar event's own subject, which the
+/// auto-join path has had in hand the whole time. When it is present the
+/// row is titled with it verbatim. When it is absent, the deterministic
+/// fallback is computed HERE, once, rather than at each call site, so
+/// there is exactly one place in the codebase that decides what an
+/// untitled recording is called.
+///
+/// Either way `meetings.title` is non-NULL the moment the row exists.
 pub fn create_meeting(
     conn: &Connection,
     audio_path: &str,
     duration_secs: u64,
     trigger_source: TriggerSource,
+    known_title: Option<&str>,
 ) -> Result<i64, StorageError> {
+    // ONE instant, used for both the stored `created_at` and the fallback
+    // title's timestamp. Two independent "now" reads could disagree across
+    // a second boundary and produce a row whose title contradicts its own
+    // creation time.
+    let created_at = chrono::Utc::now().format(SQLITE_DATETIME_FORMAT).to_string();
+
+    // A blank subject is treated as no subject. Calendar events really can
+    // carry an empty subject, and an empty title renders as a blank row in
+    // the library — strictly worse than the deterministic fallback.
+    let title = match known_title.map(str::trim).filter(|t| !t.is_empty()) {
+        Some(real) => real.to_string(),
+        None => fallback_title(trigger_source, &created_at),
+    };
+
     conn.execute(
-        "INSERT INTO meetings (created_at, duration_secs, audio_path, status, trigger_source) VALUES (datetime('now'), ?1, ?2, 'processing', ?3)",
-        rusqlite::params![duration_secs as i64, audio_path, trigger_source.as_str()],
+        "INSERT INTO meetings (created_at, duration_secs, audio_path, status, trigger_source, title) VALUES (?1, ?2, ?3, 'processing', ?4, ?5)",
+        rusqlite::params![created_at, duration_secs as i64, audio_path, trigger_source.as_str(), title],
     )?;
     Ok(conn.last_insert_rowid())
 }
@@ -360,20 +435,28 @@ pub fn all_audio_paths(conn: &Connection) -> Result<std::collections::HashSet<St
     Ok(out)
 }
 
-pub fn mark_meeting_ready(conn: &Connection, meeting_id: i64, title: &str) -> Result<(), StorageError> {
-    conn.execute(
-        "UPDATE meetings SET status = 'ready', title = ?1 WHERE id = ?2",
-        rusqlite::params![title, meeting_id],
-    )?;
+/// Status only (ISC-259). Titling used to happen here, at the very end of
+/// the pipeline, derived from the LLM summary's first six words — which is
+/// exactly the behavior being removed: every meeting now carries a real
+/// title from `create_meeting` onward, so there is nothing left for this
+/// function to name.
+pub fn mark_meeting_ready(conn: &Connection, meeting_id: i64) -> Result<(), StorageError> {
+    conn.execute("UPDATE meetings SET status = 'ready' WHERE id = ?1", [meeting_id])?;
     Ok(())
 }
 
-/// Resets a meeting back to `processing` with a clean title, for a
-/// reprocess run — mirrors the state a meeting is in right after
-/// `create_meeting`, so `process_meeting` can't tell the difference
-/// between a first run and a reprocess.
+/// Resets a meeting back to `processing` for a reprocess run.
+///
+/// Deliberately does NOT clear `title` any more. It used to, because the
+/// title was pipeline output and a stale one would have been overwritten
+/// on the next `mark_meeting_ready`. Now that titles are set at creation
+/// and never regenerated, clearing here would strand a reprocessed meeting
+/// with a permanently NULL title — the "Processing…" placeholder forever
+/// (ISC-265). A reprocess re-derives transcript/summary/speakers; it does
+/// not re-derive what the meeting is called, and it must not silently
+/// discard a name the user may have typed themselves via rename.
 pub fn mark_meeting_processing(conn: &Connection, meeting_id: i64) -> Result<(), StorageError> {
-    conn.execute("UPDATE meetings SET status = 'processing', title = NULL WHERE id = ?1", [meeting_id])?;
+    conn.execute("UPDATE meetings SET status = 'processing' WHERE id = ?1", [meeting_id])?;
     Ok(())
 }
 
@@ -857,8 +940,8 @@ mod tests {
         assert!(list.is_empty(), "old dev row is expected to be gone after a dev-schema reset");
 
         // And the schema now genuinely supports the new columns.
-        let id = create_meeting(&conn, "/some/path.wav", 42, TriggerSource::Manual).unwrap();
-        mark_meeting_ready(&conn, id, "Test Meeting").unwrap();
+        let id = create_meeting(&conn, "/some/path.wav", 42, TriggerSource::Manual, Some("Test Meeting")).unwrap();
+        mark_meeting_ready(&conn, id).unwrap();
         let list = list_meetings(&conn).unwrap();
         assert_eq!(list[0].title.as_deref(), Some("Test Meeting"));
     }
@@ -866,8 +949,8 @@ mod tests {
     #[test]
     fn ensure_schema_is_a_true_noop_when_schema_already_current() {
         let conn = test_db();
-        let id = create_meeting(&conn, "/a.wav", 10, TriggerSource::Manual).unwrap();
-        mark_meeting_ready(&conn, id, "Keep Me").unwrap();
+        let id = create_meeting(&conn, "/a.wav", 10, TriggerSource::Manual, Some("Keep Me")).unwrap();
+        mark_meeting_ready(&conn, id).unwrap();
 
         // Calling ensure_schema again (e.g. every command handler does
         // this) must NOT wipe data when the schema is already correct.
@@ -881,14 +964,14 @@ mod tests {
     #[test]
     fn full_lifecycle_create_populate_read_back() {
         let conn = test_db();
-        let id = create_meeting(&conn, "/path/to/audio.wav", 125, TriggerSource::Manual).unwrap();
+        let id = create_meeting(&conn, "/path/to/audio.wav", 125, TriggerSource::Manual, Some("Quick Sync")).unwrap();
 
         insert_transcript_segment(&conn, id, 0, Some(0), 0, 5000, "Hello there.").unwrap();
         insert_transcript_segment(&conn, id, 1, Some(1), 5000, 9000, "General Kenobi.").unwrap();
         insert_summary(&conn, id, "A brief greeting exchange.").unwrap();
         insert_action_item(&conn, id, "Follow up with Nesta", Some("Jeremiah"), Some("2026-08-10")).unwrap();
         insert_embedding(&conn, id, "Hello there.", &[0.1, 0.2, 0.3]).unwrap();
-        mark_meeting_ready(&conn, id, "Quick Sync").unwrap();
+        mark_meeting_ready(&conn, id).unwrap();
 
         let list = list_meetings(&conn).unwrap();
         assert_eq!(list.len(), 1);
@@ -907,7 +990,7 @@ mod tests {
     #[test]
     fn failed_meeting_records_error_and_status() {
         let conn = test_db();
-        let id = create_meeting(&conn, "/path/to/audio.wav", 60, TriggerSource::Manual).unwrap();
+        let id = create_meeting(&conn, "/path/to/audio.wav", 60, TriggerSource::Manual, None).unwrap();
         mark_meeting_failed(&conn, id, "ASR model failed to load").unwrap();
 
         let detail = get_meeting_detail(&conn, id).unwrap();
@@ -925,9 +1008,9 @@ mod tests {
     #[test]
     fn list_meetings_orders_newest_first() {
         let conn = test_db();
-        let id1 = create_meeting(&conn, "a.wav", 10, TriggerSource::Manual).unwrap();
+        let id1 = create_meeting(&conn, "a.wav", 10, TriggerSource::Manual, None).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(1100)); // ensure distinct created_at timestamps
-        let id2 = create_meeting(&conn, "b.wav", 20, TriggerSource::Manual).unwrap();
+        let id2 = create_meeting(&conn, "b.wav", 20, TriggerSource::Manual, None).unwrap();
 
         let list = list_meetings(&conn).unwrap();
         assert_eq!(list[0].id, id2);
@@ -944,7 +1027,7 @@ mod tests {
         {
             let conn = open_connection(&path).unwrap();
             ensure_schema(&conn).unwrap();
-            create_meeting(&conn, "unmistakable-plaintext-marker.wav", 42, TriggerSource::Manual).unwrap();
+            create_meeting(&conn, "unmistakable-plaintext-marker.wav", 42, TriggerSource::Manual, None).unwrap();
         }
 
         let raw = std::fs::read(&path).unwrap();
@@ -964,7 +1047,7 @@ mod tests {
         {
             let conn = open_connection(&path).unwrap();
             ensure_schema(&conn).unwrap();
-            create_meeting(&conn, "real-key-wrote-this.wav", 10, TriggerSource::Manual).unwrap();
+            create_meeting(&conn, "real-key-wrote-this.wav", 10, TriggerSource::Manual, None).unwrap();
         }
 
         let wrong_key_conn = Connection::open(&path).unwrap();
@@ -987,7 +1070,7 @@ mod tests {
             // connection with real schema and a real row already in it.
             let plain = Connection::open(&path).unwrap();
             ensure_schema(&plain).unwrap();
-            create_meeting(&plain, "pre-encryption-dev-data.wav", 5, TriggerSource::Manual).unwrap();
+            create_meeting(&plain, "pre-encryption-dev-data.wav", 5, TriggerSource::Manual, None).unwrap();
         }
 
         let conn = open_connection(&path).unwrap();
@@ -1007,8 +1090,8 @@ mod tests {
     #[test]
     fn rename_meeting_updates_title() {
         let conn = test_db();
-        let id = create_meeting(&conn, "a.wav", 10, TriggerSource::Manual).unwrap();
-        mark_meeting_ready(&conn, id, "Original Title").unwrap();
+        let id = create_meeting(&conn, "a.wav", 10, TriggerSource::Manual, Some("Original Title")).unwrap();
+        mark_meeting_ready(&conn, id).unwrap();
 
         rename_meeting(&conn, id, "Strategy Call with Nesta").unwrap();
 
@@ -1026,8 +1109,8 @@ mod tests {
     #[test]
     fn deleted_meeting_disappears_from_list_but_undelete_restores_it() {
         let conn = test_db();
-        let id = create_meeting(&conn, "a.wav", 10, TriggerSource::Manual).unwrap();
-        mark_meeting_ready(&conn, id, "Real Meeting").unwrap();
+        let id = create_meeting(&conn, "a.wav", 10, TriggerSource::Manual, Some("Real Meeting")).unwrap();
+        mark_meeting_ready(&conn, id).unwrap();
         assert_eq!(list_meetings(&conn).unwrap().len(), 1);
 
         delete_meeting(&conn, id).unwrap();
@@ -1070,7 +1153,7 @@ mod tests {
         ensure_schema(&conn).unwrap();
         ensure_schema(&conn).unwrap();
 
-        let id = create_meeting(&conn, "a.wav", 5, TriggerSource::Manual).unwrap();
+        let id = create_meeting(&conn, "a.wav", 5, TriggerSource::Manual, None).unwrap();
         delete_meeting(&conn, id).unwrap();
         assert!(list_meetings(&conn).unwrap().is_empty());
     }
@@ -1125,7 +1208,7 @@ mod tests {
         );
 
         // And the migrated table genuinely accepts new writes.
-        let id = create_meeting(&conn, "/new.wav", 30, TriggerSource::Calendar).unwrap();
+        let id = create_meeting(&conn, "/new.wav", 30, TriggerSource::Calendar, None).unwrap();
         assert_eq!(get_meeting_detail(&conn, id).unwrap().trigger_source, Some(TriggerSource::Calendar));
         assert_eq!(list_meetings(&conn).unwrap().len(), 2);
     }
@@ -1142,7 +1225,7 @@ mod tests {
             TriggerSource::Presence,
             TriggerSource::Recovered,
         ] {
-            let id = create_meeting(&conn, &format!("/{}.wav", expected.as_str()), 10, expected).unwrap();
+            let id = create_meeting(&conn, &format!("/{}.wav", expected.as_str()), 10, expected, None).unwrap();
             let detail = get_meeting_detail(&conn, id).unwrap();
             assert_eq!(
                 detail.trigger_source,
@@ -1183,13 +1266,217 @@ mod tests {
     #[test]
     fn list_meetings_carries_each_rows_trigger_source() {
         let conn = test_db();
-        create_meeting(&conn, "/p.wav", 10, TriggerSource::Presence).unwrap();
+        create_meeting(&conn, "/p.wav", 10, TriggerSource::Presence, None).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(1100)); // distinct created_at
-        create_meeting(&conn, "/r.wav", 20, TriggerSource::Recovered).unwrap();
+        create_meeting(&conn, "/r.wav", 20, TriggerSource::Recovered, None).unwrap();
 
         let list = list_meetings(&conn).unwrap();
         assert_eq!(list[0].trigger_source, Some(TriggerSource::Recovered));
         assert_eq!(list[1].trigger_source, Some(TriggerSource::Presence));
+    }
+
+    // ---- MeetingTitleStandardization (ISC-258 / ISC-263) ----
+
+    /// The stamp is the SYSTEM's local time, not UTC — that's the whole
+    /// point of the conversion (a fallback title must agree with
+    /// `MeetingLibrary.tsx`'s local-time date column on the same row).
+    /// Since these tests run on whatever machine is running them, they
+    /// can't assert a literal clock string; instead they independently
+    /// re-derive the expected local stamp from the same UTC input via a
+    /// structurally distinct call path, then check `fallback_title`
+    /// agrees — still catches a wrong label, a dropped "—", or a format
+    /// typo, just not a hardcoded machine-specific hour.
+    fn expected_local_stamp(utc_naive: &str) -> String {
+        use chrono::TimeZone;
+        let naive = chrono::NaiveDateTime::parse_from_str(utc_naive, SQLITE_DATETIME_FORMAT).unwrap();
+        chrono::Local.from_utc_datetime(&naive).format("%b %-d, %Y %-I:%M %p").to_string()
+    }
+
+    #[test]
+    fn fallback_title_names_a_manual_recording() {
+        let stamp = expected_local_stamp("2026-08-07 14:34:09");
+        assert_eq!(fallback_title(TriggerSource::Manual, "2026-08-07 14:34:09"), format!("Recording — {stamp}"));
+    }
+
+    #[test]
+    fn fallback_title_names_a_presence_triggered_ad_hoc_call() {
+        let stamp = expected_local_stamp("2026-08-07 14:34:09");
+        assert_eq!(
+            fallback_title(TriggerSource::Presence, "2026-08-07 14:34:09"),
+            format!("Ad Hoc Call — {stamp}")
+        );
+    }
+
+    #[test]
+    fn fallback_title_names_a_crash_recovered_recording() {
+        let stamp = expected_local_stamp("2026-08-07 14:34:09");
+        assert_eq!(
+            fallback_title(TriggerSource::Recovered, "2026-08-07 14:34:09"),
+            format!("Recovered Recording — {stamp}")
+        );
+    }
+
+    /// The format is only useful if it's readable at the edges too: a
+    /// midnight/single-digit-hour timestamp must not render as "0:05 AM"
+    /// or "Aug 07" — in local time, once converted.
+    #[test]
+    fn fallback_title_formats_midnight_and_single_digit_dates_readably() {
+        let stamp = expected_local_stamp("2026-01-03 00:05:00");
+        assert_eq!(fallback_title(TriggerSource::Manual, "2026-01-03 00:05:00"), format!("Recording — {stamp}"));
+    }
+
+    /// Total over the enum, and non-panicking on junk: a recording being
+    /// stopped must never fail because a timestamp looked odd.
+    #[test]
+    fn fallback_title_degrades_gracefully_on_an_unparseable_timestamp() {
+        let title = fallback_title(TriggerSource::Manual, "not-a-timestamp");
+        assert_eq!(title, "Recording — not-a-timestamp");
+    }
+
+    /// ISC-258, the calendar case — the whole point of the feature. The
+    /// real event subject lands in the row verbatim, immediately, with no
+    /// pipeline run involved.
+    #[test]
+    fn create_meeting_uses_a_known_calendar_subject_verbatim() {
+        let conn = test_db();
+        let id = create_meeting(
+            &conn,
+            "/cal.wav",
+            600,
+            TriggerSource::Calendar,
+            Some("PCI-DSS Assessment — Smithville"),
+        )
+        .unwrap();
+
+        // Read through the same accessors the UI uses, not a raw query.
+        assert_eq!(
+            get_meeting_detail(&conn, id).unwrap().title.as_deref(),
+            Some("PCI-DSS Assessment — Smithville")
+        );
+        assert_eq!(
+            list_meetings(&conn).unwrap()[0].title.as_deref(),
+            Some("PCI-DSS Assessment — Smithville")
+        );
+    }
+
+    /// ISC-258, the three fallback cases. Asserted against
+    /// `fallback_title` applied to the row's OWN stored `created_at`,
+    /// which is the real claim being made: the title and the timestamp in
+    /// the same row describe the same instant.
+    #[test]
+    fn create_meeting_computes_the_fallback_title_for_every_untitled_trigger_source() {
+        let conn = test_db();
+        for source in [TriggerSource::Manual, TriggerSource::Presence, TriggerSource::Recovered] {
+            let id =
+                create_meeting(&conn, &format!("/{}.wav", source.as_str()), 10, source, None).unwrap();
+            let detail = get_meeting_detail(&conn, id).unwrap();
+
+            assert_eq!(
+                detail.title.as_deref(),
+                Some(fallback_title(source, &detail.created_at).as_str()),
+                "{source:?} must be titled from its own stored created_at"
+            );
+        }
+    }
+
+    /// ISC-258's end state, stated as its own assertion: no newly-created
+    /// row is ever title-less, for any trigger source, before any pipeline
+    /// work runs. This is what makes MeetingLibrary's "Processing…"
+    /// placeholder effectively unreachable (ISC-265).
+    #[test]
+    fn a_newly_created_meeting_never_has_a_null_title() {
+        let conn = test_db();
+        for source in [
+            TriggerSource::Manual,
+            TriggerSource::Calendar,
+            TriggerSource::Presence,
+            TriggerSource::Recovered,
+        ] {
+            let id =
+                create_meeting(&conn, &format!("/n-{}.wav", source.as_str()), 10, source, None).unwrap();
+            let title = get_meeting_detail(&conn, id).unwrap().title;
+            assert!(
+                title.as_deref().is_some_and(|t| !t.trim().is_empty()),
+                "{source:?} produced an empty title: {title:?}"
+            );
+        }
+    }
+
+    /// A calendar event really can carry a blank subject. Treating it as a
+    /// real title would render an empty row in the library — worse than
+    /// the deterministic fallback, so blank is treated as absent.
+    #[test]
+    fn create_meeting_treats_a_blank_known_title_as_no_title() {
+        let conn = test_db();
+        let id = create_meeting(&conn, "/blank.wav", 10, TriggerSource::Calendar, Some("   ")).unwrap();
+        let detail = get_meeting_detail(&conn, id).unwrap();
+        assert_eq!(
+            detail.title.as_deref(),
+            Some(fallback_title(TriggerSource::Calendar, &detail.created_at).as_str())
+        );
+    }
+
+    /// ISC-259: marking a meeting ready is a status change and nothing
+    /// else. The title it was born with survives — including one the user
+    /// typed themselves.
+    #[test]
+    fn mark_meeting_ready_leaves_the_title_untouched() {
+        let conn = test_db();
+        let id = create_meeting(&conn, "/r.wav", 10, TriggerSource::Calendar, Some("Strategy Call")).unwrap();
+        rename_meeting(&conn, id, "Strategy Call with Nesta").unwrap();
+
+        mark_meeting_ready(&conn, id).unwrap();
+
+        let detail = get_meeting_detail(&conn, id).unwrap();
+        assert_eq!(detail.title.as_deref(), Some("Strategy Call with Nesta"));
+        assert_eq!(detail.status, "ready");
+    }
+
+    /// Regression guard for the gap ISC-259 opens: titles used to be
+    /// (re)written at the end of every pipeline run, so clearing the title
+    /// on reprocess was harmless. It is not any more — nothing would ever
+    /// write it back.
+    #[test]
+    fn reprocessing_a_meeting_does_not_wipe_its_title() {
+        let conn = test_db();
+        let id = create_meeting(&conn, "/a.wav", 10, TriggerSource::Calendar, Some("Smithville Scoping")).unwrap();
+        mark_meeting_ready(&conn, id).unwrap();
+
+        mark_meeting_processing(&conn, id).unwrap();
+
+        let detail = get_meeting_detail(&conn, id).unwrap();
+        assert_eq!(detail.status, "processing");
+        assert_eq!(
+            detail.title.as_deref(),
+            Some("Smithville Scoping"),
+            "a reprocess re-derives transcript and summary, never the meeting's name"
+        );
+    }
+
+    /// The stored `created_at` must stay in SQLite's own shape now that
+    /// Rust generates it — every reader downstream (including
+    /// `MeetingLibrary.tsx`'s formatDate, which appends its own "Z")
+    /// already depends on exactly this format.
+    #[test]
+    fn create_meeting_stores_created_at_in_sqlites_own_datetime_format() {
+        let conn = test_db();
+        let id = create_meeting(&conn, "/f.wav", 10, TriggerSource::Manual, None).unwrap();
+        let created_at = get_meeting_detail(&conn, id).unwrap().created_at;
+
+        assert!(
+            chrono::NaiveDateTime::parse_from_str(&created_at, SQLITE_DATETIME_FORMAT).is_ok(),
+            "created_at must stay parseable as 'YYYY-MM-DD HH:MM:SS', got {created_at:?}"
+        );
+
+        // And it must agree with what SQLite itself would have written —
+        // same UTC clock, not a local-time value that would read hours off.
+        let sqlite_now: String =
+            conn.query_row("SELECT datetime('now')", [], |row| row.get(0)).unwrap();
+        assert_eq!(
+            created_at[..10],
+            sqlite_now[..10],
+            "Rust-generated created_at must be the same UTC date SQLite would produce"
+        );
     }
 
     #[test]
@@ -1219,8 +1506,8 @@ mod tests {
     #[test]
     fn label_meeting_speaker_upserts_and_resolves_in_meeting_detail() {
         let conn = test_db();
-        let meeting_id = create_meeting(&conn, "a.wav", 10, TriggerSource::Manual).unwrap();
-        mark_meeting_ready(&conn, meeting_id, "Real Meeting").unwrap();
+        let meeting_id = create_meeting(&conn, "a.wav", 10, TriggerSource::Manual, Some("Real Meeting")).unwrap();
+        mark_meeting_ready(&conn, meeting_id).unwrap();
         insert_transcript_segment(&conn, meeting_id, 0, Some(0), 0, 1000, "hello").unwrap();
         insert_transcript_segment(&conn, meeting_id, 1, Some(1), 1000, 2000, "hi there").unwrap();
 
@@ -1246,8 +1533,8 @@ mod tests {
     #[test]
     fn unlabeled_speaker_falls_back_to_none() {
         let conn = test_db();
-        let meeting_id = create_meeting(&conn, "a.wav", 10, TriggerSource::Manual).unwrap();
-        mark_meeting_ready(&conn, meeting_id, "Real Meeting").unwrap();
+        let meeting_id = create_meeting(&conn, "a.wav", 10, TriggerSource::Manual, Some("Real Meeting")).unwrap();
+        mark_meeting_ready(&conn, meeting_id).unwrap();
         insert_transcript_segment(&conn, meeting_id, 0, Some(0), 0, 1000, "hello").unwrap();
 
         let detail = get_meeting_detail(&conn, meeting_id).unwrap();
@@ -1262,8 +1549,8 @@ mod tests {
         // boundary between them. An index-wide label would mislabel
         // whichever person didn't get to type their own name.
         let conn = test_db();
-        let meeting_id = create_meeting(&conn, "a.wav", 3000, TriggerSource::Manual).unwrap();
-        mark_meeting_ready(&conn, meeting_id, "Merged Speakers Call").unwrap();
+        let meeting_id = create_meeting(&conn, "a.wav", 3000, TriggerSource::Manual, Some("Merged Speakers Call")).unwrap();
+        mark_meeting_ready(&conn, meeting_id).unwrap();
         insert_transcript_segment(&conn, meeting_id, 0, Some(0), 0, 1000, "Jeremiah's first line").unwrap();
         insert_transcript_segment(&conn, meeting_id, 1, Some(0), 1000, 2000, "Jeremiah's second line").unwrap();
         insert_transcript_segment(&conn, meeting_id, 2, Some(0), 420_000, 430_000, "Dave's first line, misclustered as the same index").unwrap();
@@ -1298,8 +1585,8 @@ mod tests {
     #[test]
     fn segment_override_takes_precedence_over_index_wide_label() {
         let conn = test_db();
-        let meeting_id = create_meeting(&conn, "a.wav", 10, TriggerSource::Manual).unwrap();
-        mark_meeting_ready(&conn, meeting_id, "Real Meeting").unwrap();
+        let meeting_id = create_meeting(&conn, "a.wav", 10, TriggerSource::Manual, Some("Real Meeting")).unwrap();
+        mark_meeting_ready(&conn, meeting_id).unwrap();
         insert_transcript_segment(&conn, meeting_id, 0, Some(0), 0, 1000, "hello").unwrap();
         insert_transcript_segment(&conn, meeting_id, 1, Some(0), 1000, 2000, "actually someone else").unwrap();
 
@@ -1321,8 +1608,8 @@ mod tests {
     #[test]
     fn clear_meeting_processing_data_removes_everything_a_reprocess_regenerates() {
         let conn = test_db();
-        let meeting_id = create_meeting(&conn, "a.wav", 10, TriggerSource::Manual).unwrap();
-        mark_meeting_ready(&conn, meeting_id, "Real Meeting").unwrap();
+        let meeting_id = create_meeting(&conn, "a.wav", 10, TriggerSource::Manual, Some("Real Meeting")).unwrap();
+        mark_meeting_ready(&conn, meeting_id).unwrap();
         insert_transcript_segment(&conn, meeting_id, 0, Some(0), 0, 1000, "hello").unwrap();
         insert_summary(&conn, meeting_id, "a summary").unwrap();
         insert_action_item(&conn, meeting_id, "do a thing", None, None).unwrap();

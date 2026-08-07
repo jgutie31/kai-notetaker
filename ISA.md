@@ -4,8 +4,8 @@ slug: 20260805-083600_kai-notetaker
 project: kai-notetaker
 effort: deep
 effort_source: classifier
-phase: complete
-progress: 233/259
+phase: build
+progress: 242/266
 mode: interactive
 started: 2026-08-05T13:36:00Z
 updated: 2026-08-07T18:20:00Z
@@ -379,6 +379,18 @@ Ship a Tauri desktop app whose Rust core has a working, unit-tested hash-chained
 - [x] ISC-256: A real Disconnect button exists in the Calendar tab for each of the three providers — closing a genuine gap found by Jeremiah when he had no way to force a re-consent for the new `Presence.Read` scope besides Kai manually deleting a Keychain entry for him. `disconnect_provider(provider)` forgets only the stored tokens, not the client ID, so reconnecting is just the browser consent flow again, not re-pasting a client ID that hasn't changed. Required promoting two previously-`#[cfg(test)]`-gated functions (`keychain::delete_secret`, and a new real `oauth::delete_tokens` built on it) to real production code, since no non-test delete path existed at all before this (probe: `cargo build --lib` — the `#[cfg(test)]` removal itself is what made this compile for a production Tauri command in the first place; `Read` of `CalendarSettings.tsx` confirms the button and optimistic-revert-on-failure pattern, matching the existing `handleToggleAutoJoin` convention already in that file).
 - [x] ISC-257: `cargo test --lib` passes 100% and `bunx tsc --noEmit` exits 0 after the Disconnect button lands, with zero regressions (baseline going in: 175 passed).
 
+### MeetingTitleStandardization — Real calendar titles carry through; deterministic naming for everything else (2026-08-07, Jeremiah: "that's a real annoyance for me when I see the titles are randomly generated and don't have anything to do with the call")
+
+- [x] ISC-258: `storage::create_meeting` gains a new parameter, `known_title: Option<&str>`. When `Some(title)` is passed (the calendar case), the INSERT sets `meetings.title` to that exact real subject. When `None` is passed, `create_meeting` computes a deterministic fallback title ITSELF, internally, from the `trigger_source` it already receives plus the `created_at` timestamp it's about to insert — format `"{Label} — {formatted timestamp}"` (`"Recording"` for Manual, `"Ad Hoc Call"` for Presence, `"Recovered Recording"` for Recovered). Either way, **`meetings.title` is never `NULL` after creation** — the fallback-naming logic lives in exactly one place (`create_meeting` itself), not duplicated at every call site (probe: `Read` of `create_meeting` confirms both branches; a test for each of the four trigger sources — calendar with a known title, and the three fallback cases — confirms `get_meeting_detail`/`list_meetings` return a real, non-null, immediately-correct title right after `create_meeting` returns, before any pipeline processing runs).
+- [x] ISC-259: `storage::mark_meeting_ready` no longer touches `title` at all — since ISC-258 guarantees every meeting already has a real title from the moment it's created, the post-processing naming step (previously deriving a title from the LLM summary) is removed entirely, not just made conditional. `mark_meeting_ready`'s signature drops its `title` parameter; it only updates `status` (probe: `Read` confirms the `UPDATE meetings SET status = 'ready' WHERE id = ?1` no longer references `title`; `grep -n "meeting_summary"` in `pipeline.rs` confirms the summary text is no longer read to derive a title anywhere).
+- [x] ISC-260: `run_auto_join_cycle`'s calendar-triggered `start_recording` call site passes the real, already-available `meeting.subject` through — extending `start_recording`'s signature (and `ActiveRecording`'s carried state, alongside `trigger_source`, mirroring the exact pattern that already carries `TriggerSource` from start-time to the eventual `create_meeting` call at stop-time) with an `Option<String>` known title (probe: `Read` of `run_auto_join_cycle` confirms `Some(meeting.subject.clone())` is passed at the calendar trigger site; `Read` of `ActiveRecording` confirms the new field; `stop_recording` reads it back out and passes it to `create_meeting`).
+- [x] ISC-261: Anti: the presence-triggered call site (ad-hoc "Meet Now" detection) passes `known_title: None` explicitly — no attempt is made to fetch a Graph `onlineMeeting` object for an ad-hoc call to look for a subject, since ad-hoc meetings typically have no meaningful custom title and the added Graph round-trip/complexity isn't justified by what it would likely return (probe: `grep` confirms the presence-triggered call site passes `None`, not a fetch attempt).
+- [x] ISC-262: The manual Start Recording button's existing no-argument `invoke("start_recording")` call needs zero frontend changes — a new optional backend parameter with no caller-supplied value defaults to `None`, matching the exact precedent already established for `trigger_source` (probe: `git diff` on `RecordingControl.tsx` is empty).
+- [x] ISC-263: The deterministic fallback format (specified in ISC-258, implemented as a small pure function inside `storage.rs` — e.g. `fn fallback_title(trigger_source: TriggerSource, created_at: &str) -> String` — unit-testable in isolation from any DB/pipeline concern) covers exactly the three non-calendar trigger sources: `"Recording — {formatted timestamp}"` for Manual, `"Ad Hoc Call — {formatted timestamp}"` for Presence, `"Recovered Recording — {formatted timestamp}"` for Recovered, with a human-readable timestamp format (e.g. `"Aug 7, 2026 2:34 PM"`) — deterministic, computed instantly from data already on hand, never dependent on LLM output. Titles render in the SYSTEM'S LOCAL time (refined by Kai after the Engineer's draft landed in UTC — see Decisions) so a meeting's own title agrees with the library's local-time date column instead of contradicting it (probe: `cargo test --lib storage::tests` — one test per trigger source asserting the expected string, computed via an independent local-time conversion, given a fixed input timestamp).
+- [x] ISC-264: Anti: manual renaming (`rename_meeting`, already built) is completely unaffected by this feature — a user can still rename any meeting, calendar-titled or fallback-named, at any time (probe: `git diff` on the `rename_meeting` Tauri command and its `storage::rename_meeting` function is empty).
+- [x] ISC-265: `MeetingLibrary.tsx`'s existing `"Processing…"` fallback (shown when `title` is `null`) now only appears for the brief window between a meeting's row being created and either its known title or its deterministic fallback title being set — which, per ISC-258, is immediate/synchronous with creation for ALL trigger sources now (calendar gets the real subject, everything else gets the deterministic fallback) — so `"Processing…"` should in practice never be visibly seen again once this ships (probe: code review confirms every `create_meeting` call site now always supplies a real, immediately-displayable title — either the known calendar subject or the computed deterministic fallback — never leaving it to the async pipeline alone; `mark_meeting_processing` no longer clears `title` on reprocess, closing a latent regression the original spec would have shipped — see Decisions).
+- [x] ISC-266: `cargo test --lib` passes 100% and `bunx tsc --noEmit` exits 0 after MeetingTitleStandardization lands, with zero regressions (baseline going in: 175 passed; final: 187 passed).
+
 ### UI/UX (deferred until hard gates pass — placeholder ISCs for the eventual ideal state)
 
 - [x] ISC-77: refined (2026-08-06/07, corrected stale marker — real work happened earlier in this multi-day project but the checkbox was never updated): a recording-control screen exists with start/stop and a visible recording-state indicator (`RecordingControl.tsx` — device picker, record button with idle/recording states, live elapsed timer, error and last-saved states). No pause control exists (not built, not requested) — probe: `Read` of `src/components/RecordingControl.tsx` confirms `start_recording`/`stop_recording` wiring and a live timer driven by `setInterval`.
@@ -692,6 +704,36 @@ Ship a Tauri desktop app whose Rust core has a working, unit-tested hash-chained
   check: cargo test --lib exit code and pass count; bunx tsc --noEmit exit code
   threshold: exit 0 both; passed >= 171 + new tests, 0 failed
   tool: cargo test --lib && bunx tsc --noEmit
+
+- isc: ISC-258
+  type: unit-test
+  check: create_meeting sets a real, non-null title for all 4 trigger sources
+  threshold: calendar gets known_title verbatim; manual/presence/recovered get the computed fallback
+  tool: cargo test --lib storage::tests
+
+- isc: ISC-259
+  type: unit-test
+  check: mark_meeting_ready no longer sets or reads title
+  threshold: signature drops the title param; grep confirms meeting_summary unused for title
+  tool: cargo build (signature change is compile-enforced) + grep -n "meeting_summary" src-tauri/src/pipeline.rs
+
+- isc: ISC-260
+  type: unit-test
+  check: ActiveRecording carries an Option<String> known title from start_recording to stop_recording/create_meeting
+  threshold: calendar call site passes Some(meeting.subject.clone())
+  tool: cargo test --lib + grep -n "start_recording(" src-tauri/src/lib.rs
+
+- isc: ISC-263
+  type: unit-test
+  check: fallback_title exact string per trigger source given a fixed timestamp
+  threshold: exact match for Manual/Presence/Recovered
+  tool: cargo test --lib storage::tests::fallback_title*
+
+- isc: ISC-266
+  type: build-probe
+  check: cargo test --lib exit code and pass count; bunx tsc --noEmit exit code
+  threshold: exit 0 both; passed >= 175 + new tests, 0 failed
+  tool: cargo test --lib && bunx tsc --noEmit
 ```
 
 ## Features
@@ -876,6 +918,12 @@ Ship a Tauri desktop app whose Rust core has a working, unit-tested hash-chained
   satisfies: [ISC-256, ISC-257]
   depends_on: [CalendarOAuth]
   parallelizable: false
+
+- name: MeetingTitleStandardization
+  description: Real calendar meeting titles carry through to the recording immediately; a deterministic trigger-source+timestamp naming convention replaces the old LLM-summary-snippet fallback for everything else
+  satisfies: [ISC-258, ISC-259, ISC-260, ISC-261, ISC-262, ISC-263, ISC-264, ISC-265, ISC-266]
+  depends_on: [AutoJoinRecording, TeamsPresenceAdhocRecording, RecordingTriggerProvenance, StorageLayer]
+  parallelizable: false
 ```
 
 ## Decisions
@@ -962,6 +1010,8 @@ Ship a Tauri desktop app whose Rust core has a working, unit-tested hash-chained
   5. **Compliance Recording Bot**: the one path that would have worked completely and correctly. Real findings, each verified rather than assumed: no Microsoft ISV certification required for KCG-internal-only use (only for reselling to other tenants); licensing requires the M365 license only on the policy-holder (Jeremiah), not on external call participants — resolving his stated licensing concern in his favor; but the underlying real-time media SDK is confirmed **Windows Server-only for runtime execution, no Linux/macOS support** — meaning Jeremiah's existing Ubuntu-based Hostinger VPS (`ubuntu.vps.ciso.assistant`, running CISO Assistant) cannot host it, a new Windows machine and a separate .NET/C# service would be required, with real recurring cloud-hosting cost (~$25-45/month estimated for light internal use, not a quoted figure). Jeremiah's own words at the pause point: "I don't like this at all anymore" — the new-infrastructure/cost/new-tech-stack requirement, once concretely quantified, changed his own calculus. This is a real, informed no, not a stalled investigation.
   
   **Nothing was implemented for any of these five** — the shipped app's actual behavior remains raw mic capture, mute-blind, exactly as it was before this investigation began. Follow-up, whenever Jeremiah returns to this: the Process Tap (#2) remains a real, ready-to-build, zero-cost, zero-new-infrastructure option that solves half the problem cleanly on its own; the only remaining option for his own voice, given every automatic path is now confirmed closed, is a kai-notetaker-controlled pause (hotkey or a click on the existing overlay badge) that he'd operate himself — not yet decided, not yet built.
+- 2026-08-07 (MeetingTitleStandardization delegated to Engineer, independently verified by Kai — not trusted from self-report alone): Jeremiah's request — real calendar/Teams titles carry through immediately, a deterministic naming convention replaces the old LLM-summary-snippet fallback for everything else — landed clean against spec. The Engineer's own build surfaced one real latent bug the spec itself would have shipped: `mark_meeting_processing` used to clear `title` to `NULL` on every reprocess, which was harmless only because `mark_meeting_ready` used to re-derive a title from the LLM summary afterward. Removing that re-derivation (the whole point of ISC-259) without also un-coupling this reset would have permanently stranded any reprocessed meeting — including one Jeremiah had renamed by hand — on `"Processing…"` forever, a direct ISC-265 violation. Fixed in the same round, guarded by a new regression test (`reprocessing_a_meeting_does_not_wipe_its_title`). `cargo test --lib` → 187 passed (baseline 175, +12 new), `bunx tsc --noEmit` → exit 0, both independently re-run by Kai, not just accepted from the report.
+- 2026-08-07 (Kai's own follow-on fix, decided directly rather than presented as an open question — per Jeremiah's standing "stop presenting options, just execute" instruction after the audio-scope pause above): the Engineer flagged, correctly, that `fallback_title` formatted the UTC `created_at` verbatim with no local-time conversion — meaning a 2:34 PM Central ad-hoc call would title itself `"...7:34 PM"` while `MeetingLibrary.tsx`'s own date column (which does convert to local) showed 2:34 PM on the very same row. That is exactly the "titles don't match what actually happened on the call" annoyance this whole feature exists to fix, so it wasn't treated as a stylistic preference — it's a correctness bug, decided and fixed directly: `fallback_title` now converts the stored UTC instant to the system's local time before formatting (`chrono::DateTime::<Utc>::from_naive_utc_and_offset(...).with_timezone(&Local)`), while `meetings.created_at` itself stays UTC (unchanged storage format, so nothing else downstream is affected). This makes the four exact-string unit tests machine-dependent by nature (a local-time stamp can't be a hardcoded literal across arbitrary test machines), so they were rewritten to independently re-derive the expected local stamp via a structurally distinct conversion call rather than calling `fallback_title` itself — still catches a wrong label or a dropped em-dash, just not a hardcoded clock string. Also fixed in the same pass: `examples/import_legacy_recordings.rs`, flagged by the Engineer as already broken pre-existing (missing the `trigger_source`/`known_title` args `create_meeting` has required since ISC-246/ISC-258) — given `TriggerSource::Manual` (a deliberately-run import script, not a crash recovery) and the loop's own `stem` as `known_title`, since a real filename-derived name is a better title than any generic fallback for legacy-imported audio. `cargo build --example import_legacy_recordings` now finishes clean.
 
 ## Changelog
 
@@ -987,6 +1037,9 @@ Ship a Tauri desktop app whose Rust core has a working, unit-tested hash-chained
 
 ## Verification
 
+- **MeetingTitleStandardization, independently re-verified by Kai (not trusted from Engineer's self-report alone):** `git diff` on `storage.rs`/`lib.rs`/`pipeline.rs` read line-by-line and confirmed to match the delegated spec exactly, including both deliberate deviations (blank-title-as-absent, `mark_meeting_processing` no longer clearing `title`). `git diff --stat -- src/components/RecordingControl.tsx` → empty, confirming ISC-262. `cargo test --lib` → `test result: ok. 187 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 212.43s` (baseline 175, +12 new tests). `bunx tsc --noEmit` → exit 0.
+- ISC-258/259/263 (local-time fix, Kai's own follow-on): `Read` of `storage.rs` confirms `fallback_title` converts via `chrono::DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc).with_timezone(&Local)` before formatting; the four exact-string tests (`fallback_title_names_a_manual_recording` etc.) rewritten to independently re-derive the expected stamp via `chrono::Local.from_utc_datetime(&naive)` rather than calling `fallback_title` itself, still pass in the same 187-count run above.
+- `examples/import_legacy_recordings.rs` (pre-existing break, fixed): `cargo build --example import_legacy_recordings` → `Finished \`dev\` profile [unoptimized + debuginfo] target(s) in 3.62s`, zero errors (only pre-existing, unrelated dead-code warnings elsewhere in the crate).
 - ISC-1/2: `git log --oneline` — `3d9b1ca Initial Tauri + React/TS scaffold (create-tauri-app, bun)`; `package.json` + `src-tauri/Cargo.toml` both present post-scaffold.
 - ISC-3: Fresh non-interactive Bash call — `which rustc cargo` → `/opt/homebrew/bin/rustc` / `/opt/homebrew/bin/cargo` (symlinked from Homebrew keg-only rustup into an already-on-PATH directory, since `~/.zshrc` isn't sourced by non-interactive tool calls).
 - ISC-4: `cargo check` — `Finished \`dev\` profile [unoptimized + debuginfo] target(s) in 53.70s` on the unmodified scaffold.

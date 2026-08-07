@@ -249,7 +249,13 @@ fn main() {
             }
         };
 
-        let meeting_id = match storage::create_meeting(&conn, dest.to_str().unwrap(), duration_secs) {
+        let meeting_id = match storage::create_meeting(
+            &conn,
+            dest.to_str().unwrap(),
+            duration_secs,
+            storage::TriggerSource::Manual,
+            Some(stem.as_ref()),
+        ) {
             Ok(id) => id,
             Err(e) => {
                 eprintln!("FAILED to create meeting row for {stem}: {e}");

@@ -54,6 +54,12 @@ struct ActiveRecording {
     session: audio_capture::RecordingSession,
     started_at: Instant,
     trigger_source: storage::TriggerSource,
+    /// The real name of the thing being recorded, when it was already
+    /// known at START (ISC-260) — in practice a calendar event's subject.
+    /// Rides along for exactly the same reason `trigger_source` does: by
+    /// STOP time, when `create_meeting` finally runs, the calendar context
+    /// that started this recording may be gone from the poller's view.
+    known_title: Option<String>,
 }
 
 /// Tracks the meeting AutoJoinRecording is currently capturing, if any —
@@ -234,6 +240,7 @@ fn start_recording(
     app: tauri::AppHandle,
     state: State<RecordingState>,
     trigger_source: Option<storage::TriggerSource>,
+    known_title: Option<String>,
 ) -> Result<(), String> {
     let trigger_source = trigger_source.unwrap_or(storage::TriggerSource::Manual);
     let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
@@ -246,7 +253,7 @@ fn start_recording(
     if guard.is_some() {
         return Err("a recording is already in progress".to_string());
     }
-    *guard = Some(ActiveRecording { session, started_at: Instant::now(), trigger_source });
+    *guard = Some(ActiveRecording { session, started_at: Instant::now(), trigger_source, known_title });
 
     // Only after the capture is genuinely live and committed to state — the
     // badge must never claim a recording that an early return above
@@ -298,7 +305,7 @@ fn stop_recording(
     auto_recording_state: State<AutoRecordingState>,
 ) -> Result<StopRecordingResult, String> {
     let mut guard = state.0.lock().map_err(|_| "recording state lock poisoned")?;
-    let ActiveRecording { session, started_at, trigger_source } =
+    let ActiveRecording { session, started_at, trigger_source, known_title } =
         guard.take().ok_or("no recording in progress")?;
     let elapsed = started_at.elapsed().as_secs();
     let path = session.stop_and_write().map_err(|e| e.to_string())?;
@@ -319,11 +326,18 @@ fn stop_recording(
     let audit_path = paths.data_dir.join("audit-log.jsonl");
     let conn = storage::open_connection(&db_path).map_err(|e| e.to_string())?;
     storage::ensure_schema(&conn).map_err(|e| e.to_string())?;
-    // ISC-248: read back out of the recording's own state, never
-    // re-derived here — by stop time the calendar/presence context that
-    // started this recording may well be gone.
-    let meeting_id = storage::create_meeting(&conn, &path.display().to_string(), elapsed, trigger_source)
-        .map_err(|e| e.to_string())?;
+    // ISC-248/ISC-260: both the trigger source and the known title are read
+    // back out of the recording's own state, never re-derived here — by stop
+    // time the calendar/presence context that started this recording may
+    // well be gone.
+    let meeting_id = storage::create_meeting(
+        &conn,
+        &path.display().to_string(),
+        elapsed,
+        trigger_source,
+        known_title.as_deref(),
+    )
+    .map_err(|e| e.to_string())?;
 
     // Heavy CPU/GPU-bound work — a real OS thread, not an async task, so
     // it never blocks Tokio's worker pool or the UI thread. Waits for
@@ -662,10 +676,15 @@ fn run_auto_join_cycle(app: &tauri::AppHandle, db_path: &std::path::Path) {
             // differs is what gets recorded ABOUT the recording: this site
             // states its own trigger explicitly (ISC-250) and never falls
             // through to the Manual default.
+            // ISC-260: the event's real subject is already in hand right
+            // here and rides along to `create_meeting` at stop time, so the
+            // meeting is named the thing it actually is from the moment its
+            // row exists — no LLM guess, no waiting for the pipeline.
             if let Err(e) = start_recording(
                 app.clone(),
                 app.state::<RecordingState>(),
                 Some(storage::TriggerSource::Calendar),
+                Some(meeting.subject.clone()),
             ) {
                 eprintln!("auto-join: failed to start recording for '{}': {e}", meeting.subject);
             } else {
@@ -764,10 +783,16 @@ fn run_presence_cycle(app: &tauri::AppHandle) {
         // path — so an ad-hoc capture produces an identical on-disk artifact
         // and runs the identical downstream pipeline. Explicit trigger
         // (ISC-250) — an ad-hoc capture must never be filed as Manual.
+        // ISC-261: `None`, deliberately — an ad-hoc call has no calendar
+        // event, and fetching a Graph `onlineMeeting` object to look for a
+        // subject would spend a round-trip to retrieve a generic
+        // system-generated string. The deterministic "Ad Hoc Call — …"
+        // fallback is both cheaper and more honest.
         match start_recording(
             app.clone(),
             app.state::<RecordingState>(),
             Some(storage::TriggerSource::Presence),
+            None,
         ) {
             Ok(()) => {
                 println!("presence: detected an ad-hoc Teams call — started recording");
@@ -1251,11 +1276,16 @@ fn recover_orphan_into_db(
     // ISC-251: hardcoded `Recovered`, not derived from anything. Whatever
     // originally triggered this recording died with the process — saying
     // "recovered" is the only claim we can actually stand behind.
+    // `known_title: None` for the same reason the trigger source is
+    // hardcoded `Recovered` — whatever this recording was called died with
+    // the process. The deterministic "Recovered Recording — …" fallback is
+    // the only name we can stand behind.
     let meeting_id = storage::create_meeting(
         conn,
         &path.display().to_string(),
         duration_secs,
         storage::TriggerSource::Recovered,
+        None,
     )
     .map_err(|e| e.to_string())?;
     Ok(Some(meeting_id))
@@ -1734,6 +1764,7 @@ mod orphan_recovery_tests {
             &existing.display().to_string(),
             2,
             storage::TriggerSource::Manual,
+            None,
         )
         .unwrap();
 
