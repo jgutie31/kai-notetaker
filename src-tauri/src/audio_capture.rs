@@ -17,6 +17,7 @@ use rubato::{Async, FixedAsync, Indexing, Resampler, SincInterpolationParameters
 use rubato::audioadapter_buffers::direct::InterleavedSlice;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use thiserror::Error;
@@ -42,6 +43,143 @@ pub const PIPELINE_SAMPLE_RATE: u32 = 16_000;
 /// the sinc filter has enough context per call.
 const RESAMPLE_CHUNK_FRAMES: usize = 1024;
 
+/// How often the flusher thread checkpoints newly-captured audio to disk
+/// (drain-from-buffer → `write_sample` → `hound::WavWriter::flush()`).
+///
+/// **This is the worst-case audio-loss bound on an ungraceful death**
+/// (dev-mode rebuild, crash, force-quit, power loss). `flush()` patches
+/// the RIFF and `data` chunk size headers and pushes bytes to the OS, so
+/// per hound's own documented guarantee the file "can still be read by a
+/// compliant decoder up to the last flush" even if the writing process
+/// dies immediately afterward. Everything captured *since* that last
+/// checkpoint is what's at risk — roughly this many seconds, not the
+/// whole recording (which was the pre-2026-08-06 behavior that really
+/// did destroy the "First Meeting" recording).
+///
+/// Tradeoff: a shorter interval bounds the loss more tightly but pays
+/// more disk I/O and more `seek`-heavy header rewrites per minute; a
+/// longer interval is cheaper but risks more audio. 5 seconds is the
+/// deliberate middle — a lost 5-second window at the tail of a meeting
+/// is a survivable annoyance, and one flush per 5s of 48kHz mono i16
+/// (~480KB) is negligible I/O for any machine that can run local ASR.
+///
+/// **Honest bound, not a bug to chase (ISC-216):** a crash inside the
+/// very first `FLUSH_INTERVAL_SECS` of a brand-new recording, before any
+/// checkpoint has ever run, can still lose that entire initial window.
+/// Audio that has not yet physically been captured cannot be made
+/// durable. The guarantee is "lose at most a few seconds," never "never
+/// lose anything."
+pub const FLUSH_INTERVAL_SECS: u64 = 5;
+
+/// How often the flusher thread wakes to check whether a stop has been
+/// requested. Deliberately far shorter than `FLUSH_INTERVAL_SECS` so
+/// clicking Stop Recording is never blocked waiting for the next
+/// scheduled checkpoint (ISC-215) — the disk-flush *cadence* stays at
+/// the full interval, only the stop-responsiveness is fine-grained.
+const FLUSH_POLL_TICK_MS: u64 = 200;
+
+/// Convert one captured f32 sample to the 16-bit PCM the WAV file
+/// declares. Extracted so the flusher thread and any future writer path
+/// can never drift apart in how they quantize.
+fn to_i16_sample(s: f32) -> i16 {
+    (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16
+}
+
+/// The concrete writer type `hound::WavWriter::create` hands back.
+type WavFileWriter = hound::WavWriter<std::io::BufWriter<std::fs::File>>;
+
+/// Owns the background checkpointing thread for one recording.
+struct FlusherHandle {
+    stop: Arc<AtomicBool>,
+    join: std::thread::JoinHandle<Result<(), hound::Error>>,
+}
+
+/// Lock helper that treats a poisoned buffer mutex as recoverable. A
+/// poisoned lock here means some *other* thread panicked while holding
+/// it; the `Vec<f32>` itself is still structurally sound, and refusing to
+/// checkpoint already-captured audio because of an unrelated panic would
+/// be exactly the data-loss behavior this whole feature exists to
+/// prevent.
+fn lock_buffer(buffer: &Mutex<Vec<f32>>) -> std::sync::MutexGuard<'_, Vec<f32>> {
+    buffer.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Spawn the checkpointing thread (ISC-210). This thread — never the
+/// real-time `cpal` callback (ISC-211) — is the *only* owner of the
+/// `WavWriter`, so no lock is needed around the writer at all.
+///
+/// It keeps its own `already_written` cursor into the shared capture
+/// buffer and only ever *reads* `buffer[already_written..]`. It never
+/// truncates, drains, or otherwise mutates the buffer, so
+/// `trailing_rms`'s full-history 60-second window (ISC-200) keeps
+/// working exactly as before.
+fn spawn_flusher(
+    mut writer: WavFileWriter,
+    buffer: Arc<Mutex<Vec<f32>>>,
+    stop: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<Result<(), hound::Error>> {
+    std::thread::spawn(move || {
+        let ticks_per_flush = (FLUSH_INTERVAL_SECS * 1000) / FLUSH_POLL_TICK_MS;
+        let mut already_written: usize = 0;
+        let mut ticks: u64 = 0;
+
+        loop {
+            let stopping = stop.load(Ordering::SeqCst);
+
+            if stopping || ticks >= ticks_per_flush {
+                ticks = 0;
+
+                // Lock held only long enough to copy out the new tail —
+                // the real-time callback needs this same lock to append.
+                let fresh: Vec<f32> = {
+                    let samples = lock_buffer(&buffer);
+                    if samples.len() > already_written {
+                        samples[already_written..].to_vec()
+                    } else {
+                        Vec::new()
+                    }
+                };
+                already_written += fresh.len();
+
+                for &s in &fresh {
+                    if let Err(e) = writer.write_sample(to_i16_sample(s)) {
+                        // Logged HERE, not just at eventual stop_and_write
+                        // join: a disk-full or other write failure mid-
+                        // recording silently ends checkpointing, and a
+                        // long meeting might not be stopped for a long
+                        // time afterward — the durability guarantee this
+                        // whole feature exists for degrades silently
+                        // unless this is visible the moment it happens.
+                        eprintln!("recording flusher: write failed, durability checkpointing has stopped: {e}");
+                        return Err(e);
+                    }
+                }
+
+                if stopping {
+                    // Clean stop: the stream is already dropped by this
+                    // point, so `fresh` above was genuinely the last of
+                    // the audio. `finalize()` writes the definitive
+                    // header and consumes the writer — byte-for-byte
+                    // what the pre-durability `stop_and_write` produced.
+                    if let Err(e) = writer.finalize() {
+                        eprintln!("recording flusher: finalize failed on stop: {e}");
+                        return Err(e);
+                    }
+                    return Ok(());
+                }
+
+                if let Err(e) = writer.flush() {
+                    eprintln!("recording flusher: flush failed, durability checkpointing has stopped: {e}");
+                    return Err(e);
+                }
+            }
+
+            std::thread::sleep(Duration::from_millis(FLUSH_POLL_TICK_MS));
+            ticks += 1;
+        }
+    })
+}
+
 #[derive(Debug, Error)]
 pub enum AudioCaptureError {
     #[error("no input device available")]
@@ -59,6 +197,13 @@ pub enum AudioCaptureError {
     Io(#[from] std::io::Error),
     #[error("resampler error: {0}")]
     Resampler(String),
+    /// The background WAV checkpointing thread died unexpectedly. Surfaced
+    /// as a real error rather than silently swallowed — if the flusher
+    /// panicked, the recording on disk may be short by however much audio
+    /// arrived after its last successful checkpoint, and the caller has to
+    /// know that.
+    #[error("recording flusher thread failed: {0}")]
+    Flusher(String),
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -262,10 +407,31 @@ pub fn trailing_rms_of(samples: &[f32], window_secs: f32) -> Option<f32> {
 /// already captured into `buffer`, and without changing the file's
 /// declared sample rate — every stream normalizes to
 /// `CANONICAL_SAMPLE_RATE` before writing into the shared buffer.
+///
+/// As of RecordingDurability (2026-08-06) the session also owns a
+/// background flusher thread that checkpoints captured audio to a real
+/// WAV file on disk every `FLUSH_INTERVAL_SECS`, so an ungraceful death
+/// costs at most that many seconds instead of the entire recording.
 pub struct RecordingSession {
     path: PathBuf,
     stream: Option<cpal::Stream>,
     buffer: Arc<Mutex<Vec<f32>>>,
+    flusher: Option<FlusherHandle>,
+}
+
+impl Drop for RecordingSession {
+    /// Hygiene only — a session dropped without `stop_and_write` (a code
+    /// path that shouldn't exist, but shouldn't leak a live thread if it
+    /// ever does) signals its flusher to wind down. This is NOT what
+    /// makes the durability guarantee: a real ungraceful death (SIGKILL,
+    /// panic-abort, power loss) runs no destructors at all. The file is
+    /// already valid on disk from the last `flush()` regardless.
+    fn drop(&mut self) {
+        if let Some(flusher) = self.flusher.take() {
+            flusher.stop.store(true, Ordering::SeqCst);
+            let _ = flusher.join.join();
+        }
+    }
 }
 
 impl RecordingSession {
@@ -278,6 +444,13 @@ impl RecordingSession {
     /// data directory — this function does not resolve or validate that
     /// itself (the caller, `lib.rs`, owns that resolution), but it never
     /// falls back to a system temp directory on its own.
+    ///
+    /// The WAV file is opened **immediately** (ISC-209), not lazily at
+    /// `stop_and_write` as it was before RecordingDurability — an
+    /// initial `flush()` runs synchronously here so a valid,
+    /// zero-duration WAV genuinely exists on disk before this function
+    /// returns, rather than only once the buffered header bytes happen
+    /// to reach the filesystem.
     pub fn start(data_dir: &Path, recording_id: &str) -> Result<Self, AudioCaptureError> {
         let host = cpal::default_host();
         let device = host
@@ -288,13 +461,41 @@ impl RecordingSession {
         std::fs::create_dir_all(&recordings_dir)?;
         let path = recordings_dir.join(format!("{recording_id}.wav"));
 
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: CANONICAL_SAMPLE_RATE,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&path, spec)?;
+        // Force the header out of the BufWriter to the real file now, so
+        // the "a valid WAV exists from the first moment" guarantee is
+        // deterministic rather than dependent on buffering timing.
+        writer.flush()?;
+
         let buffer = Arc::new(Mutex::new(Vec::<f32>::new()));
-        let stream = build_capture_stream(&device, buffer.clone())?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let join = spawn_flusher(writer, buffer.clone(), stop.clone());
+
+        // Started last: no audio can be captured before there is a
+        // writer thread ready to checkpoint it. If the stream fails to
+        // build we must wind the flusher down by hand — `Self` was never
+        // constructed, so its `Drop` would never run and the thread
+        // would leak for the life of the process.
+        let stream = match build_capture_stream(&device, buffer.clone()) {
+            Ok(s) => s,
+            Err(e) => {
+                stop.store(true, Ordering::SeqCst);
+                let _ = join.join();
+                return Err(e);
+            }
+        };
 
         Ok(Self {
             path,
             stream: Some(stream),
             buffer,
+            flusher: Some(FlusherHandle { stop, join }),
         })
     }
 
@@ -340,28 +541,49 @@ impl RecordingSession {
         Ok(())
     }
 
-    /// Stop recording and flush the buffered samples to disk as a 16-bit
-    /// PCM mono WAV at `CANONICAL_SAMPLE_RATE` — always that rate,
-    /// regardless of how many devices were used during the recording.
+    /// Stop recording and finish the WAV file on disk: 16-bit PCM mono at
+    /// `CANONICAL_SAMPLE_RATE` — always that rate, regardless of how many
+    /// devices were used during the recording.
+    ///
+    /// Signature and return type are unchanged from before
+    /// RecordingDurability (ISC-213) — all three call sites in `lib.rs`
+    /// (the `stop_recording` command, the calendar-end auto-stop, and the
+    /// silence prompt's Stop callback) required zero changes. What
+    /// changed is *where the bytes come from*: the flusher thread has
+    /// already written most of them incrementally, so this call only
+    /// drains whatever arrived since the last checkpoint, then
+    /// `finalize()`s. The resulting file is identical in every
+    /// observable way to what the old write-everything-at-stop path
+    /// produced (ISC-214).
+    ///
+    /// Ordering matters and is deliberate: the stream is dropped *first*
+    /// so no new samples can land after the stop flag is set, guaranteeing
+    /// the flusher's final drain genuinely sees the last sample.
     pub fn stop_and_write(mut self) -> Result<PathBuf, AudioCaptureError> {
         // Dropping the stream stops capture.
         self.stream.take();
 
-        let samples = self.buffer.lock().unwrap();
-        let spec = hound::WavSpec {
-            channels: 1,
-            sample_rate: CANONICAL_SAMPLE_RATE,
-            bits_per_sample: 16,
-            sample_format: hound::SampleFormat::Int,
-        };
-        let mut writer = hound::WavWriter::create(&self.path, spec)?;
-        for &s in samples.iter() {
-            let clamped = (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
-            writer.write_sample(clamped)?;
-        }
-        writer.finalize()?;
+        let flusher = self
+            .flusher
+            .take()
+            .ok_or_else(|| AudioCaptureError::Flusher("session has no flusher thread".to_string()))?;
 
-        Ok(self.path.clone())
+        flusher.stop.store(true, Ordering::SeqCst);
+        match flusher.join.join() {
+            Ok(Ok(())) => Ok(self.path.clone()),
+            // A real write/flush/finalize failure inside the thread — the
+            // file on disk is still valid up to its last good checkpoint,
+            // but the caller must not be told the stop succeeded cleanly.
+            Ok(Err(e)) => Err(AudioCaptureError::Wav(e)),
+            Err(panic) => {
+                let detail = panic
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "flusher thread panicked".to_string());
+                Err(AudioCaptureError::Flusher(detail))
+            }
+        }
     }
 }
 
@@ -627,6 +849,182 @@ mod tests {
         std::thread::sleep(Duration::from_millis(200));
         let len_after = session.buffer.lock().unwrap().len();
         assert!(len_after > len_before, "capture must keep running after an RMS read: before={len_before}, after={len_after}");
+
+        let path = session.stop_and_write().unwrap();
+        delete_recording(&path).unwrap();
+        std::fs::remove_dir_all(&tmp_data_dir).ok();
+    }
+
+    /// ISC-209: a valid WAV exists on disk from the very first moment of
+    /// recording — before `stop_and_write` is ever called, before a
+    /// single checkpoint has run. This is what makes every later
+    /// guarantee possible: there is always a real file to flush into.
+    #[test]
+    fn wav_file_exists_and_is_valid_immediately_after_start_before_any_stop() {
+        let tmp_data_dir = std::env::temp_dir().join(format!("kai-notetaker-test-eager-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp_data_dir).unwrap();
+
+        if list_input_devices().map(|d| d.is_empty()).unwrap_or(true) {
+            eprintln!("skipping: no input device available in this environment");
+            std::fs::remove_dir_all(&tmp_data_dir).ok();
+            return;
+        }
+
+        let session = RecordingSession::start(&tmp_data_dir, "eager-writer").unwrap();
+        let path = session.path().to_path_buf();
+
+        // No sleep, no stop — the file must already be there and already
+        // be a structurally valid WAV a decoder can open.
+        assert!(path.exists(), "WAV file must exist on disk the moment start() returns");
+        let reader = hound::WavReader::open(&path)
+            .expect("a freshly-started recording must already be a decodable WAV");
+        assert_eq!(reader.spec().sample_rate, CANONICAL_SAMPLE_RATE);
+        assert_eq!(reader.spec().channels, 1);
+        assert_eq!(reader.spec().bits_per_sample, 16);
+        drop(reader);
+
+        let written = session.stop_and_write().unwrap();
+        delete_recording(&written).unwrap();
+        std::fs::remove_dir_all(&tmp_data_dir).ok();
+    }
+
+    /// ISC-210 — the actual proof the durability fix works, not merely
+    /// that `flush()` gets called.
+    ///
+    /// The file is opened and read **while the session is still live**,
+    /// after at least one checkpoint has run. At that instant
+    /// `finalize()` has provably never been called on the writer (the
+    /// writer is still owned by the running flusher thread), so a
+    /// readable file with a real, non-zero duration can only be the
+    /// result of `flush()` having patched the RIFF/data size headers —
+    /// exactly the situation a crashed process leaves behind. Before
+    /// RecordingDurability this file would have been zero bytes, or
+    /// absent entirely, and the audio unrecoverable.
+    #[test]
+    fn recording_killed_mid_flight_is_still_a_valid_readable_wav_up_to_the_last_flush() {
+        let tmp_data_dir = std::env::temp_dir().join(format!("kai-notetaker-test-crash-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp_data_dir).unwrap();
+
+        if list_input_devices().map(|d| d.is_empty()).unwrap_or(true) {
+            eprintln!("skipping: no input device available in this environment");
+            std::fs::remove_dir_all(&tmp_data_dir).ok();
+            return;
+        }
+
+        let session = RecordingSession::start(&tmp_data_dir, "crash-sim").unwrap();
+        let path = session.path().to_path_buf();
+
+        // Wait past one full checkpoint cycle (plus poll-tick slack) so
+        // at least one real flush has definitely happened.
+        std::thread::sleep(Duration::from_millis(
+            FLUSH_INTERVAL_SECS * 1000 + FLUSH_POLL_TICK_MS * 4,
+        ));
+
+        let reader = hound::WavReader::open(&path)
+            .expect("a mid-flight, never-finalized recording must still open as a valid WAV");
+        let frames = reader.duration();
+        assert_eq!(reader.spec().sample_rate, CANONICAL_SAMPLE_RATE);
+        assert!(
+            frames > 0,
+            "the checkpointed file must contain real audio, got {frames} frames"
+        );
+        drop(reader);
+
+        // Now end the session the ungraceful way — never calling
+        // stop_and_write. (A true SIGKILL runs no destructors at all;
+        // the assertions above, taken before any drop, are what actually
+        // prove the crash case. This drop only keeps the test process
+        // from leaking a live capture thread.)
+        drop(session);
+
+        let reader = hound::WavReader::open(&path)
+            .expect("the file must still be readable after an abandoned session");
+        assert!(reader.duration() >= frames, "checkpointed audio must never be lost");
+        drop(reader);
+
+        delete_recording(&path).unwrap();
+        std::fs::remove_dir_all(&tmp_data_dir).ok();
+    }
+
+    /// ISC-215: clicking Stop Recording must feel immediate — the stop
+    /// path is gated on the flusher's short poll tick, never on waiting
+    /// out the next scheduled `FLUSH_INTERVAL_SECS` checkpoint.
+    #[test]
+    fn stop_and_write_returns_well_under_one_full_flush_interval() {
+        let tmp_data_dir = std::env::temp_dir().join(format!("kai-notetaker-test-stopfast-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp_data_dir).unwrap();
+
+        if list_input_devices().map(|d| d.is_empty()).unwrap_or(true) {
+            eprintln!("skipping: no input device available in this environment");
+            std::fs::remove_dir_all(&tmp_data_dir).ok();
+            return;
+        }
+
+        let session = RecordingSession::start(&tmp_data_dir, "stop-responsiveness").unwrap();
+        // Deliberately far less than one flush interval: stop is being
+        // requested at the worst possible moment, right after a
+        // checkpoint, with a full interval still to run.
+        std::thread::sleep(Duration::from_millis(300));
+
+        let began = std::time::Instant::now();
+        let path = session.stop_and_write().unwrap();
+        let elapsed = began.elapsed();
+
+        // Generous ceiling (one poll tick + scheduling slack) that is
+        // still unambiguously "well under" the 5s flush interval — a
+        // regression that reintroduced interval-gated stopping would
+        // take ~5s and blow straight past this.
+        let ceiling = Duration::from_millis(FLUSH_POLL_TICK_MS * 4);
+        assert!(
+            elapsed < ceiling,
+            "stop_and_write took {elapsed:?}, which is not well under FLUSH_INTERVAL_SECS={FLUSH_INTERVAL_SECS}s (ceiling {ceiling:?})"
+        );
+
+        // And it still produced a real, finalized, valid file.
+        let reader = hound::WavReader::open(&path).unwrap();
+        assert_eq!(reader.spec().sample_rate, CANONICAL_SAMPLE_RATE);
+        drop(reader);
+
+        delete_recording(&path).unwrap();
+        std::fs::remove_dir_all(&tmp_data_dir).ok();
+    }
+
+    /// ISC-210 (buffer-integrity half) / ISC-200 regression: the flusher
+    /// reads the buffer with its own cursor and never truncates it, so
+    /// `trailing_rms`'s full-history window keeps working across many
+    /// checkpoint cycles. If the flusher ever drained the buffer instead
+    /// of copying from it, silence detection would silently break.
+    #[test]
+    fn flusher_never_truncates_the_buffer_trailing_rms_keeps_working() {
+        let tmp_data_dir = std::env::temp_dir().join(format!("kai-notetaker-test-nodrain-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp_data_dir).unwrap();
+
+        if list_input_devices().map(|d| d.is_empty()).unwrap_or(true) {
+            eprintln!("skipping: no input device available in this environment");
+            std::fs::remove_dir_all(&tmp_data_dir).ok();
+            return;
+        }
+
+        let session = RecordingSession::start(&tmp_data_dir, "no-drain").unwrap();
+        std::thread::sleep(Duration::from_millis(
+            FLUSH_INTERVAL_SECS * 1000 + FLUSH_POLL_TICK_MS * 4,
+        ));
+
+        // More than one full flush interval of audio has been
+        // checkpointed by now; the in-memory buffer must still hold ALL
+        // of it, not just the un-flushed tail.
+        let buffered = session.buffer.lock().unwrap().len();
+        let one_interval = FLUSH_INTERVAL_SECS as usize * CANONICAL_SAMPLE_RATE as usize;
+        assert!(
+            buffered >= one_interval,
+            "buffer must retain the full history after checkpointing: {buffered} samples < {one_interval}"
+        );
+        // And an RMS window spanning already-flushed audio is still
+        // computable — the exact thing draining the buffer would break.
+        assert!(
+            session.trailing_rms(FLUSH_INTERVAL_SECS as f32).is_some(),
+            "trailing_rms over an already-checkpointed window must still be measurable"
+        );
 
         let path = session.stop_and_write().unwrap();
         delete_recording(&path).unwrap();

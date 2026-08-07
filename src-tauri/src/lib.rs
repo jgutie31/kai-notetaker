@@ -884,6 +884,177 @@ fn label_transcript_segments(
     Ok(())
 }
 
+// ---------------------------------------------------------------------
+// Startup orphan-recording recovery (ISC-217 … ISC-221)
+//
+// RecordingDurability makes a crashed recording's WAV file *survive* on
+// disk. That file is still useless until something notices it and runs
+// the pipeline over it — which is what this scan does, exactly once per
+// launch. It is safe to run at startup precisely because the app is
+// single-instance: at the moment `setup()` runs, no `RecordingSession`
+// can exist, so any auto-generated-pattern `.wav` without a `meetings`
+// row is necessarily a leftover from a previous, dead process.
+// ---------------------------------------------------------------------
+
+/// True only for filenames the app itself generates in `start_recording`
+/// (`chrono::Utc::now().format("%Y%m%dT%H%M%S")` + `.wav`) — i.e. the
+/// regex `^\d{8}T\d{6}\.wav$`, hand-rolled to avoid pulling in the
+/// `regex` crate for one fixed-width pattern.
+///
+/// Anti (ISC-218): this is also the guard that keeps `imported-*` files
+/// — owned exclusively by the `import_legacy_recordings` example binary
+/// — out of the scan. They cannot match a fixed 8-digit/T/6-digit shape.
+fn is_auto_generated_recording_name(name: &str) -> bool {
+    // 8 digits + 'T' + 6 digits + ".wav"
+    if name.len() != 8 + 1 + 6 + 4 {
+        return false;
+    }
+    let (stem, ext) = name.split_at(15);
+    if ext != ".wav" {
+        return false;
+    }
+    let bytes = stem.as_bytes();
+    bytes[8] == b'T'
+        && bytes[..8].iter().all(u8::is_ascii_digit)
+        && bytes[9..].iter().all(u8::is_ascii_digit)
+}
+
+/// Every `.wav` in `recordings_dir` that the app generated itself and
+/// that has no matching `meetings.audio_path` row. Sorted, so recovery
+/// order is deterministic (oldest recording first, since the filename is
+/// itself a sortable timestamp).
+fn find_orphaned_recordings(
+    recordings_dir: &std::path::Path,
+    known_audio_paths: &std::collections::HashSet<String>,
+) -> Vec<PathBuf> {
+    let entries = match std::fs::read_dir(recordings_dir) {
+        Ok(e) => e,
+        // No recordings dir yet (first ever launch) is not an error —
+        // there is simply nothing to recover.
+        Err(_) => return Vec::new(),
+    };
+
+    let mut out: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(is_auto_generated_recording_name)
+        })
+        .filter(|path| !known_audio_paths.contains(&path.display().to_string()))
+        .collect();
+    out.sort();
+    out
+}
+
+/// Real duration of a WAV, read from its own header — never guessed,
+/// never hardcoded (ISC-220). `duration()` is frames-per-channel, so
+/// dividing by the declared sample rate gives real wall-clock seconds
+/// regardless of channel count.
+fn wav_duration_secs(path: &std::path::Path) -> Result<u64, hound::Error> {
+    let reader = hound::WavReader::open(path)?;
+    let rate = reader.spec().sample_rate.max(1) as u64;
+    Ok(reader.duration() as u64 / rate)
+}
+
+/// Creates the `meetings` row for one orphaned recording and returns its
+/// id. Split out from the pipeline kickoff so the DB half is testable
+/// without loading the four heavy engines.
+///
+/// Returns `Ok(None)` for a file whose header reports zero seconds of
+/// audio — a recording killed inside its very first checkpoint window
+/// (the honest bound named on `FLUSH_INTERVAL_SECS`). There is nothing
+/// to transcribe, and creating a row for it would only produce a
+/// permanently-failed meeting in the library.
+fn recover_orphan_into_db(
+    conn: &rusqlite::Connection,
+    path: &std::path::Path,
+) -> Result<Option<i64>, String> {
+    let duration_secs = wav_duration_secs(path).map_err(|e| format!("unreadable WAV {}: {e}", path.display()))?;
+    if duration_secs == 0 {
+        return Ok(None);
+    }
+    let meeting_id = storage::create_meeting(conn, &path.display().to_string(), duration_secs)
+        .map_err(|e| e.to_string())?;
+    Ok(Some(meeting_id))
+}
+
+/// The full startup pass: find orphans, create their meetings, and hand
+/// each one to the *same* `pipeline::process_meeting` background-thread
+/// call `stop_recording` uses (ISC-221) — no parallel recovery pipeline.
+fn recover_orphaned_recordings(
+    data_dir: &std::path::Path,
+    engines_state: Arc<Mutex<Option<Arc<PipelineEngines>>>>,
+) {
+    let db_path = data_dir.join("kai-notetaker.sqlite3");
+    let audit_path = data_dir.join("audit-log.jsonl");
+    let recordings_dir = data_dir.join("recordings");
+
+    let conn = match storage::open_connection(&db_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("orphan recovery: failed to open db: {e}");
+            return;
+        }
+    };
+    let known = match storage::all_audio_paths(&conn) {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("orphan recovery: failed to read existing audio paths: {e}");
+            return;
+        }
+    };
+
+    for path in find_orphaned_recordings(&recordings_dir, &known) {
+        let meeting_id = match recover_orphan_into_db(&conn, &path) {
+            Ok(Some(id)) => id,
+            Ok(None) => {
+                eprintln!(
+                    "orphan recovery: skipping {} — zero-duration WAV (crashed before its first checkpoint)",
+                    path.display()
+                );
+                continue;
+            }
+            Err(e) => {
+                eprintln!("orphan recovery: {e}");
+                continue;
+            }
+        };
+        println!(
+            "orphan recovery: recovered crashed recording {} as meeting {meeting_id}",
+            path.display()
+        );
+
+        // Identical shape to stop_recording's kickoff: own OS thread,
+        // wait for engines, own DB connection, same audit log, same
+        // process_meeting call.
+        let engines_handle = engines_state.clone();
+        let db_path = db_path.clone();
+        let audit_path = audit_path.clone();
+        std::thread::spawn(move || {
+            let engines = loop {
+                if let Some(e) = engines_handle.lock().unwrap().clone() {
+                    break e;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            };
+            let conn = match storage::open_connection(&db_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("orphan recovery: failed to open db for meeting {meeting_id}: {e}");
+                    return;
+                }
+            };
+            let audit = AuditLog::new(&audit_path);
+            if let Err(e) = pipeline::process_meeting(&conn, &audit, &engines, meeting_id, &path, None) {
+                eprintln!("orphan recovery: pipeline failed for meeting {meeting_id}: {e}");
+            }
+        });
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -945,7 +1116,17 @@ pub fn run() {
             // second model loads.
             let engines_state = app.state::<EnginesState>().0.clone();
             let models_dir = model_provisioning::resolve_models_dir(&data_dir);
-            spawn_engine_loading(models_dir, data_dir.clone(), engines_state);
+            spawn_engine_loading(models_dir, data_dir.clone(), engines_state.clone());
+
+            // One-time (not interval) scan for recordings a previous
+            // process died holding — a dev-mode rebuild, a crash, a
+            // force-quit. Runs AFTER ensure_schema above so the
+            // `meetings` table is guaranteed to exist, and before any
+            // recording can start, so it can never race a live session
+            // (ISC-217). Every filesystem/DB failure inside is logged
+            // and skipped, never panicked — a weird leftover file must
+            // not stop the app from launching.
+            recover_orphaned_recordings(&data_dir, engines_state);
 
             tauri::async_runtime::spawn(async move {
                 // Sweep once shortly after launch, then on a fixed interval.
@@ -1036,4 +1217,213 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod orphan_recovery_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    /// A real, decodable WAV of a known duration, written the same way
+    /// (16-bit mono @ CANONICAL_SAMPLE_RATE) a real recording is — so
+    /// duration assertions are against genuine header math, not a stub.
+    fn write_fixture_wav(path: &std::path::Path, secs: u32) {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 48_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(path, spec).unwrap();
+        for _ in 0..(48_000 * secs) {
+            writer.write_sample(0_i16).unwrap();
+        }
+        writer.finalize().unwrap();
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "kai-notetaker-orphan-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// ISC-217: the pattern is exactly the one `start_recording`
+    /// generates — nothing wider, nothing narrower.
+    #[test]
+    fn only_the_apps_own_auto_generated_filename_pattern_is_recognized() {
+        assert!(is_auto_generated_recording_name("20260806T165724.wav"));
+        assert!(is_auto_generated_recording_name("19991231T000000.wav"));
+
+        // ISC-218: the import tool's files, in every shape it produces.
+        assert!(!is_auto_generated_recording_name("imported-20260806T165724.wav"));
+        assert!(!is_auto_generated_recording_name("imported-first-meeting.wav"));
+
+        // Near-misses that must not slip through.
+        assert!(!is_auto_generated_recording_name("20260806T16572.wav"), "5-digit time");
+        assert!(!is_auto_generated_recording_name("20260806T1657244.wav"), "7-digit time");
+        assert!(!is_auto_generated_recording_name("20260806X165724.wav"), "wrong separator");
+        assert!(!is_auto_generated_recording_name("2026080AT165724.wav"), "non-digit date");
+        assert!(!is_auto_generated_recording_name("20260806T16572A.wav"), "non-digit time");
+        assert!(!is_auto_generated_recording_name("20260806T165724.WAV"), "case-sensitive extension");
+        assert!(!is_auto_generated_recording_name("20260806T165724.wav.bak"));
+        assert!(!is_auto_generated_recording_name("test-recording.wav"));
+        assert!(!is_auto_generated_recording_name(""));
+    }
+
+    /// ISC-217 + ISC-218 + ISC-219 in one realistic fixture: a mixed
+    /// `recordings/` directory containing an orphan, an already-known
+    /// recording, an `imported-*` file, and unrelated junk. Exactly the
+    /// orphan comes back.
+    #[test]
+    fn scan_selects_only_the_orphaned_auto_generated_recording() {
+        let dir = temp_dir("scan");
+        let recordings = dir.join("recordings");
+        std::fs::create_dir_all(&recordings).unwrap();
+
+        let orphan = recordings.join("20260806T165724.wav");
+        let already_known = recordings.join("20260805T090000.wav");
+        let imported = recordings.join("imported-20260101T120000.wav");
+        let junk = recordings.join("notes.txt");
+        write_fixture_wav(&orphan, 1);
+        write_fixture_wav(&already_known, 1);
+        write_fixture_wav(&imported, 1);
+        std::fs::write(&junk, b"not audio").unwrap();
+
+        let known: HashSet<String> = [already_known.display().to_string()].into_iter().collect();
+        let found = find_orphaned_recordings(&recordings, &known);
+
+        assert_eq!(found, vec![orphan.clone()], "expected exactly the orphan, got {found:?}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// ISC-219 (anti): a file with a matching `meetings.audio_path` row
+    /// is never re-recovered — proven against a real SQLite DB and
+    /// re-run to simulate repeated app restarts.
+    #[test]
+    fn a_recording_with_a_matching_meetings_row_is_never_re_recovered() {
+        let dir = temp_dir("norepeat");
+        let recordings = dir.join("recordings");
+        std::fs::create_dir_all(&recordings).unwrap();
+
+        let existing = recordings.join("20260806T101010.wav");
+        write_fixture_wav(&existing, 2);
+
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        storage::ensure_schema(&conn).unwrap();
+        storage::create_meeting(&conn, &existing.display().to_string(), 2).unwrap();
+
+        // Three "restarts" — each one must find nothing.
+        for restart in 1..=3 {
+            let known = storage::all_audio_paths(&conn).unwrap();
+            let found = find_orphaned_recordings(&recordings, &known);
+            assert!(found.is_empty(), "restart {restart} wrongly re-recovered {found:?}");
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// ISC-218 (anti), end to end against a real DB: an `imported-*`
+    /// file with NO `meetings` row — the exact situation that would tempt
+    /// a naive scan — is still left completely alone, while the orphan
+    /// beside it is recovered.
+    #[test]
+    fn imported_prefixed_files_are_never_recovered_even_with_no_meetings_row() {
+        let dir = temp_dir("imported");
+        let recordings = dir.join("recordings");
+        std::fs::create_dir_all(&recordings).unwrap();
+
+        let orphan = recordings.join("20260806T235959.wav");
+        let imported = recordings.join("imported-legacy-call.wav");
+        write_fixture_wav(&orphan, 3);
+        write_fixture_wav(&imported, 3);
+
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        storage::ensure_schema(&conn).unwrap();
+        // Deliberately empty: neither file has a row.
+        let known = storage::all_audio_paths(&conn).unwrap();
+        assert!(known.is_empty());
+
+        let found = find_orphaned_recordings(&recordings, &known);
+        assert_eq!(found, vec![orphan], "the imported-* file must never be touched");
+
+        let recovered: Vec<i64> = found
+            .iter()
+            .filter_map(|p| recover_orphan_into_db(&conn, p).unwrap())
+            .collect();
+        assert_eq!(recovered.len(), 1);
+
+        // And the imported file still has no row afterwards.
+        let after = storage::all_audio_paths(&conn).unwrap();
+        assert!(!after.contains(&imported.display().to_string()));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// ISC-220: the recovered meeting's `duration_secs` is the WAV's real
+    /// header duration, not a guess and not zero.
+    #[test]
+    fn recovered_meeting_duration_matches_the_real_wav_header_duration() {
+        let dir = temp_dir("duration");
+        let recordings = dir.join("recordings");
+        std::fs::create_dir_all(&recordings).unwrap();
+
+        let orphan = recordings.join("20260806T121212.wav");
+        write_fixture_wav(&orphan, 7); // known real duration
+
+        assert_eq!(wav_duration_secs(&orphan).unwrap(), 7);
+
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        storage::ensure_schema(&conn).unwrap();
+        let meeting_id = recover_orphan_into_db(&conn, &orphan).unwrap().expect("a 7s WAV is recoverable");
+
+        let detail = storage::get_meeting_detail(&conn, meeting_id).unwrap();
+        assert_eq!(detail.duration_secs, 7, "duration must come from the real WAV header");
+        assert_eq!(detail.audio_path.as_deref(), Some(orphan.display().to_string().as_str()));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The honest bound from `FLUSH_INTERVAL_SECS`, made explicit: a
+    /// recording killed before its first checkpoint has a valid but
+    /// empty WAV. Recovery skips it rather than creating a meeting that
+    /// could only ever fail in the pipeline.
+    #[test]
+    fn a_zero_duration_orphan_is_skipped_not_turned_into_a_broken_meeting() {
+        let dir = temp_dir("empty");
+        let recordings = dir.join("recordings");
+        std::fs::create_dir_all(&recordings).unwrap();
+
+        let empty = recordings.join("20260806T000001.wav");
+        write_fixture_wav(&empty, 0);
+
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        storage::ensure_schema(&conn).unwrap();
+
+        // It IS identified as an orphan by the scan...
+        let known = storage::all_audio_paths(&conn).unwrap();
+        assert_eq!(find_orphaned_recordings(&recordings, &known), vec![empty.clone()]);
+        // ...but recovery declines to create a row for it.
+        assert_eq!(recover_orphan_into_db(&conn, &empty).unwrap(), None);
+        assert!(storage::all_audio_paths(&conn).unwrap().is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A missing `recordings/` directory (genuine first launch) is not an
+    /// error — the app must still start.
+    #[test]
+    fn a_missing_recordings_directory_yields_no_orphans_and_no_panic() {
+        let dir = temp_dir("missing");
+        let never_created = dir.join("recordings");
+        assert!(find_orphaned_recordings(&never_created, &HashSet::new()).is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

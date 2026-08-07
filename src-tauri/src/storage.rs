@@ -262,6 +262,22 @@ pub fn create_meeting(conn: &Connection, audio_path: &str, duration_secs: u64) -
     Ok(conn.last_insert_rowid())
 }
 
+/// Every non-null `audio_path` currently recorded in `meetings`, as one
+/// query. Used by the startup orphan-recovery scan (ISC-217/ISC-219) to
+/// diff on-disk recordings against the DB in memory rather than issuing
+/// one query per file — and deliberately including soft-deleted rows, so
+/// a deleted meeting's leftover audio file is never "recovered" back into
+/// existence on the next launch.
+pub fn all_audio_paths(conn: &Connection) -> Result<std::collections::HashSet<String>, StorageError> {
+    let mut stmt = conn.prepare("SELECT audio_path FROM meetings WHERE audio_path IS NOT NULL")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let mut out = std::collections::HashSet::new();
+    for row in rows {
+        out.insert(row?);
+    }
+    Ok(out)
+}
+
 pub fn mark_meeting_ready(conn: &Connection, meeting_id: i64, title: &str) -> Result<(), StorageError> {
     conn.execute(
         "UPDATE meetings SET status = 'ready', title = ?1 WHERE id = ?2",
