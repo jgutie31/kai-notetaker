@@ -89,13 +89,43 @@ struct AppPaths {
     data_dir: PathBuf,
 }
 
+/// The background thread handle for `spawn_engine_loading`, so the app's
+/// exit handler can wait for in-flight model loading to fully finish
+/// before letting the process tear down.
+///
+/// Real crash, confirmed 2026-08-07: quitting shortly after launch — while
+/// this thread is still constructing the Metal-backed Whisper/LLM/embedding
+/// contexts — races the loading thread's async Metal resource-set init
+/// against ggml's own atexit-time global Metal device teardown on the main
+/// thread. `ggml_metal_device_free` -> `ggml_metal_rsets_free` -> aborted
+/// while `__ggml_metal_rsets_init_block_invoke` was still mid-flight on the
+/// loading thread. Nothing in this app's own Rust code was unsound; the
+/// race is entirely inside vendored ggml's C++ lifecycle, so the fix is to
+/// never let the process's normal exit path run concurrently with it.
+#[derive(Default, Clone)]
+struct EngineLoadHandle(Arc<Mutex<Option<std::thread::JoinHandle<()>>>>);
+
+/// `true` only while a `spawn_engine_loading` thread is still running.
+/// `None` (nothing ever spawned, or a prior load's handle was already
+/// taken/joined) and "spawned but finished" both read as `false` — the
+/// exit path should only ever pause for the narrow window where Metal
+/// init could genuinely still be in flight.
+fn engine_load_still_in_progress(load_handle: &Mutex<Option<std::thread::JoinHandle<()>>>) -> bool {
+    load_handle.lock().unwrap().as_ref().map(|h| !h.is_finished()).unwrap_or(false)
+}
+
 /// Loads the four heavy models from `models_dir` in a background OS
 /// thread and populates `engines_state` on success. Shared by app startup
 /// (models already present) and by `download_missing_models` (models
 /// just finished downloading) — both cases converge on the same
 /// "models are on disk now, go load them" moment.
-fn spawn_engine_loading(models_dir: PathBuf, data_dir: PathBuf, engines_state: Arc<Mutex<Option<Arc<PipelineEngines>>>>) {
-    std::thread::spawn(move || {
+fn spawn_engine_loading(
+    models_dir: PathBuf,
+    data_dir: PathBuf,
+    engines_state: Arc<Mutex<Option<Arc<PipelineEngines>>>>,
+    load_handle: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
+) {
+    let handle = std::thread::spawn(move || {
         if !model_provisioning::missing_models(&models_dir).is_empty() {
             println!("models not yet provisioned — waiting for first-run download to complete");
             return;
@@ -150,6 +180,7 @@ fn spawn_engine_loading(models_dir: PathBuf, data_dir: PathBuf, engines_state: A
         *engines_state.lock().unwrap() = Some(Arc::new(PipelineEngines { asr, diarization, llm, embedding, speaker_id }));
         println!("all pipeline engines loaded and ready");
     });
+    *load_handle.lock().unwrap() = Some(handle);
 }
 
 #[tauri::command]
@@ -1038,12 +1069,18 @@ fn check_missing_models(paths: State<AppPaths>) -> Vec<String> {
 /// ~4.6GB) and must not block the command/UI thread. Real downloads
 /// always target `$APPDATA/models`, not the dev-fallback source tree.
 #[tauri::command]
-fn download_missing_models(app: tauri::AppHandle, paths: State<AppPaths>, engines: State<EnginesState>) {
+fn download_missing_models(
+    app: tauri::AppHandle,
+    paths: State<AppPaths>,
+    engines: State<EnginesState>,
+    load_handle: State<EngineLoadHandle>,
+) {
     use tauri::Emitter;
 
     let models_dir = paths.data_dir.join("models");
     let data_dir = paths.data_dir.clone();
     let engines_state = engines.0.clone();
+    let load_handle = load_handle.0.clone();
     let missing: Vec<model_provisioning::ModelSpec> =
         model_provisioning::missing_models(&models_dir).into_iter().cloned().collect();
 
@@ -1066,7 +1103,7 @@ fn download_missing_models(app: tauri::AppHandle, paths: State<AppPaths>, engine
             }
         }
         let _ = app.emit("model-download-complete", ());
-        spawn_engine_loading(models_dir, data_dir, engines_state);
+        spawn_engine_loading(models_dir, data_dir, engines_state, load_handle);
     });
 }
 
@@ -1375,6 +1412,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(RecordingState::default())
         .manage(EnginesState::default())
+        .manage(EngineLoadHandle::default())
         .manage(AutoRecordingState::default())
         .manage(SilenceTrackerState::default())
         .invoke_handler(tauri::generate_handler![
@@ -1477,8 +1515,9 @@ pub fn run() {
             // window appears immediately rather than stalling on multi-
             // second model loads.
             let engines_state = app.state::<EnginesState>().0.clone();
+            let load_handle = app.state::<EngineLoadHandle>().0.clone();
             let models_dir = model_provisioning::resolve_models_dir(&data_dir);
-            spawn_engine_loading(models_dir, data_dir.clone(), engines_state.clone());
+            spawn_engine_loading(models_dir, data_dir.clone(), engines_state.clone(), load_handle);
 
             // One-time (not interval) scan for recordings a previous
             // process died holding — a dev-mode rebuild, a crash, a
@@ -1606,8 +1645,32 @@ pub fn run() {
 
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app_handle, event| {
+            // ISC (crash fix, 2026-08-07): never let the process's normal
+            // exit proceed while model loading is still in flight — see
+            // `EngineLoadHandle`'s doc comment for the exact race this
+            // closes. The common case (loading already finished) adds a
+            // single non-blocking `is_finished()` check and nothing else.
+            if let tauri::RunEvent::ExitRequested { api, .. } = event {
+                let load_handle = app_handle.state::<EngineLoadHandle>().0.clone();
+                if engine_load_still_in_progress(&load_handle) {
+                    api.prevent_exit();
+                    let app_handle = app_handle.clone();
+                    std::thread::spawn(move || {
+                        if let Some(handle) = load_handle.lock().unwrap().take() {
+                            let _ = handle.join();
+                        }
+                        // By now the loading thread (and any Metal init it
+                        // kicked off) has fully finished, so this second
+                        // exit is safe — `still_loading` will be false and
+                        // the default exit path proceeds normally.
+                        app_handle.exit(0);
+                    });
+                }
+            }
+        });
 }
 
 #[cfg(test)]
@@ -1657,6 +1720,73 @@ mod recording_badge_tests {
             assert!(x >= 0.0, "{size:?} produced a negative x");
             assert!(y >= 0.0);
         }
+    }
+}
+
+#[cfg(test)]
+mod engine_load_handle_tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    /// Steady state before any load has ever run, and after a prior
+    /// load's handle was already taken/joined — both must read as "not
+    /// in progress," or the exit handler would wait forever on nothing.
+    #[test]
+    fn nothing_ever_spawned_is_not_in_progress() {
+        let handle: Mutex<Option<std::thread::JoinHandle<()>>> = Mutex::new(None);
+        assert!(!engine_load_still_in_progress(&handle));
+    }
+
+    /// The exact race this fix closes: while the loading thread is still
+    /// running, the check must say so — this is what makes the exit
+    /// handler call `prevent_exit()` instead of letting ggml's atexit
+    /// teardown run concurrently with in-flight Metal init.
+    #[test]
+    fn a_running_load_thread_is_in_progress() {
+        let (tx, rx) = mpsc::channel::<()>();
+        let handle = std::thread::spawn(move || {
+            rx.recv().ok();
+        });
+        let slot = Mutex::new(Some(handle));
+        assert!(engine_load_still_in_progress(&slot));
+
+        // Release it and let the check catch up — proves this isn't
+        // hardcoded true, it's actually reading real thread state.
+        tx.send(()).unwrap();
+        if let Some(h) = slot.lock().unwrap().take() {
+            h.join().unwrap();
+        }
+        assert!(!engine_load_still_in_progress(&slot));
+    }
+
+    /// A handle that finished on its own (no exit ever raced it) must
+    /// read as "not in progress" without needing an explicit `.take()` —
+    /// the exit handler only actually joins when it found the race.
+    #[test]
+    fn a_finished_load_thread_is_not_in_progress() {
+        let handle = std::thread::spawn(|| {});
+        handle.join().unwrap();
+        // is_finished() on an already-joined handle would panic on most
+        // std APIs (JoinHandle is consumed by join), so this test spawns
+        // a second one and waits for it to naturally finish instead —
+        // the real-world case is "loading completed before quit was ever
+        // requested," not "already joined by someone else."
+        let (tx, rx) = mpsc::channel::<()>();
+        let handle = std::thread::spawn(move || {
+            tx.send(()).unwrap();
+        });
+        rx.recv().unwrap();
+        // Give the thread a moment to actually mark itself finished after
+        // the send — is_finished() reflects OS thread completion, not the
+        // channel send itself.
+        for _ in 0..1000 {
+            if handle.is_finished() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let slot = Mutex::new(Some(handle));
+        assert!(!engine_load_still_in_progress(&slot));
     }
 }
 
