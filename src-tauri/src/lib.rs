@@ -115,6 +115,47 @@ fn engine_load_still_in_progress(load_handle: &Mutex<Option<std::thread::JoinHan
     load_handle.lock().unwrap().as_ref().map(|h| !h.is_finished()).unwrap_or(false)
 }
 
+/// Counts how many background threads are currently running
+/// `pipeline::process_meeting` — real, GPU/Metal-touching inference work,
+/// same category as `spawn_engine_loading`, just triggered later in the
+/// app's life instead of once at startup.
+///
+/// Real second crash, confirmed 2026-08-07, over an hour into a session
+/// (well outside the "still loading at startup" window `EngineLoadHandle`
+/// guards): the identical `ggml_metal_rsets_free` -> `ggml_abort` signature
+/// fired again on quit, this time racing a *meeting-processing* thread's
+/// first real inference call — the moment ggml's Metal backend lazily
+/// builds a resource set sized for the actual workload, not something
+/// that happens at model *load* time. `stop_recording`,
+/// `reprocess_meeting_with_speaker_count`, and orphan recovery each spawn
+/// their own fire-and-forget processing thread with no handle kept
+/// anywhere — `EngineLoadHandle` alone never had visibility into any of
+/// them. This counter generalizes the same fix to all three (and any
+/// future call site that touches these engines) instead of leaving three
+/// more copies of the identical landmine.
+#[derive(Default, Clone)]
+struct ActiveGpuWork(Arc<std::sync::atomic::AtomicUsize>);
+
+/// RAII guard: increments the counter on creation, decrements on drop —
+/// including on an early `return` or a panic — so a processing thread is
+/// never left "forgotten" by the counter no matter which of its several
+/// return paths (DB open failure, pipeline error, success) it takes.
+struct GpuWorkGuard(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for GpuWorkGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Call as the very first line inside a spawned closure that is about to
+/// touch `PipelineEngines` — hold the returned guard for the closure's
+/// entire body, not just part of it.
+fn begin_gpu_work(counter: &Arc<std::sync::atomic::AtomicUsize>) -> GpuWorkGuard {
+    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    GpuWorkGuard(counter.clone())
+}
+
 /// Loads the four heavy models from `models_dir` in a background OS
 /// thread and populates `engines_state` on success. Shared by app startup
 /// (models already present) and by `download_missing_models` (models
@@ -504,6 +545,7 @@ fn stop_recording(
     engines_state: State<EnginesState>,
     paths: State<AppPaths>,
     auto_recording_state: State<AutoRecordingState>,
+    active_gpu_work: State<ActiveGpuWork>,
 ) -> Result<StopRecordingResult, String> {
     let mut guard = state.0.lock().map_err(|_| "recording state lock poisoned")?;
     let ActiveRecording { session, started_at, trigger_source, known_title } =
@@ -546,7 +588,13 @@ fn stop_recording(
     // loading is normally much faster than a real meeting's length).
     let engines_handle = engines_state.0.clone();
     let audio_path = path.clone();
+    let gpu_work = active_gpu_work.0.clone();
     std::thread::spawn(move || {
+        // Held for the whole closure (ISC: QuitCrashRace generalization,
+        // 2026-08-07) — this is what lets the app's exit handler know a
+        // real Metal-touching inference call could still be in flight
+        // long after startup, not just during the initial model load.
+        let _gpu_guard = begin_gpu_work(&gpu_work);
         let engines = loop {
             if let Some(e) = engines_handle.lock().unwrap().clone() {
                 break e;
@@ -587,6 +635,7 @@ fn reprocess_meeting_with_speaker_count(
     num_speakers: i32,
     paths: State<AppPaths>,
     engines: State<EnginesState>,
+    active_gpu_work: State<ActiveGpuWork>,
 ) -> Result<(), String> {
     let db_path = paths.data_dir.join("kai-notetaker.sqlite3");
     let conn = storage::open_connection(&db_path).map_err(|e| e.to_string())?;
@@ -607,7 +656,9 @@ fn reprocess_meeting_with_speaker_count(
     let engines_arc = engines.0.lock().map_err(|_| "engines lock poisoned".to_string())?.clone().ok_or("models are still loading — try again shortly")?;
     let db_path = db_path.clone();
     let audit_path = paths.data_dir.join("audit-log.jsonl");
+    let gpu_work = active_gpu_work.0.clone();
     std::thread::spawn(move || {
+        let _gpu_guard = begin_gpu_work(&gpu_work);
         let conn = match storage::open_connection(&db_path) {
             Ok(c) => c,
             Err(e) => {
@@ -798,6 +849,7 @@ fn run_auto_join_cycle(app: &tauri::AppHandle, db_path: &std::path::Path) {
                 app.state::<EnginesState>(),
                 app.state::<AppPaths>(),
                 app.state::<AutoRecordingState>(),
+                app.state::<ActiveGpuWork>(),
             ) {
                 Ok(result) => println!("auto-join: auto-stopped '{subject}' — meeting_id={}", result.meeting_id),
                 Err(e) => eprintln!("auto-join: failed to auto-stop '{subject}': {e}"),
@@ -1026,6 +1078,7 @@ fn run_presence_cycle(app: &tauri::AppHandle) {
             app.state::<EnginesState>(),
             app.state::<AppPaths>(),
             app.state::<AutoRecordingState>(),
+            app.state::<ActiveGpuWork>(),
         ) {
             Ok(result) => println!("presence: the ad-hoc call ended — auto-stopped, meeting_id={}", result.meeting_id),
             Err(e) => eprintln!("presence: failed to auto-stop the ad-hoc recording: {e}"),
@@ -1149,6 +1202,7 @@ fn prompt_stop_or_continue(app: &tauri::AppHandle, dialog_open: Arc<std::sync::a
                     app_for_callback.state::<EnginesState>(),
                     app_for_callback.state::<AppPaths>(),
                     app_for_callback.state::<AutoRecordingState>(),
+                    app_for_callback.state::<ActiveGpuWork>(),
                 ) {
                     Ok(result) => println!("silence monitor: stopped on request — meeting_id={}", result.meeting_id),
                     Err(e) => eprintln!("silence monitor: failed to stop the recording: {e}"),
@@ -1504,6 +1558,7 @@ fn recover_orphan_into_db(
 fn recover_orphaned_recordings(
     data_dir: &std::path::Path,
     engines_state: Arc<Mutex<Option<Arc<PipelineEngines>>>>,
+    active_gpu_work: Arc<std::sync::atomic::AtomicUsize>,
 ) {
     let db_path = data_dir.join("kai-notetaker.sqlite3");
     let audit_path = data_dir.join("audit-log.jsonl");
@@ -1550,7 +1605,9 @@ fn recover_orphaned_recordings(
         let engines_handle = engines_state.clone();
         let db_path = db_path.clone();
         let audit_path = audit_path.clone();
+        let gpu_work = active_gpu_work.clone();
         std::thread::spawn(move || {
+            let _gpu_guard = begin_gpu_work(&gpu_work);
             let engines = loop {
                 if let Some(e) = engines_handle.lock().unwrap().clone() {
                     break e;
@@ -1643,6 +1700,7 @@ pub fn run() {
         .manage(RecordingState::default())
         .manage(EnginesState::default())
         .manage(EngineLoadHandle::default())
+        .manage(ActiveGpuWork::default())
         .manage(AutoRecordingState::default())
         .manage(SilenceTrackerState::default())
         .invoke_handler(tauri::generate_handler![
@@ -1778,7 +1836,7 @@ pub fn run() {
             // (ISC-217). Every filesystem/DB failure inside is logged
             // and skipped, never panicked — a weird leftover file must
             // not stop the app from launching.
-            recover_orphaned_recordings(&data_dir, engines_state);
+            recover_orphaned_recordings(&data_dir, engines_state, app.state::<ActiveGpuWork>().0.clone());
 
             tauri::async_runtime::spawn(async move {
                 // Sweep once shortly after launch, then on a fixed interval.
@@ -1899,24 +1957,34 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app_handle, event| {
-            // ISC (crash fix, 2026-08-07): never let the process's normal
-            // exit proceed while model loading is still in flight — see
-            // `EngineLoadHandle`'s doc comment for the exact race this
-            // closes. The common case (loading already finished) adds a
-            // single non-blocking `is_finished()` check and nothing else.
+            // ISC (crash fix, 2026-08-07, generalized same day after a
+            // second real crash): never let the process's normal exit
+            // proceed while EITHER the initial model-loading thread OR any
+            // per-meeting pipeline-processing thread is still in flight —
+            // see `EngineLoadHandle`'s and `ActiveGpuWork`'s doc comments
+            // for the exact race this closes. The common case (nothing in
+            // flight) costs two non-blocking checks and nothing else.
             if let tauri::RunEvent::ExitRequested { api, .. } = event {
                 let load_handle = app_handle.state::<EngineLoadHandle>().0.clone();
-                if engine_load_still_in_progress(&load_handle) {
+                let active_gpu_work = app_handle.state::<ActiveGpuWork>().0.clone();
+                let still_loading = engine_load_still_in_progress(&load_handle);
+                let processing = active_gpu_work.load(std::sync::atomic::Ordering::SeqCst) > 0;
+                if still_loading || processing {
                     api.prevent_exit();
                     let app_handle = app_handle.clone();
                     std::thread::spawn(move || {
                         if let Some(handle) = load_handle.lock().unwrap().take() {
                             let _ = handle.join();
                         }
-                        // By now the loading thread (and any Metal init it
-                        // kicked off) has fully finished, so this second
-                        // exit is safe — `still_loading` will be false and
-                        // the default exit path proceeds normally.
+                        // Can't "join" a counter — poll until every
+                        // in-flight processing thread's guard has dropped.
+                        while active_gpu_work.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                            std::thread::sleep(std::time::Duration::from_millis(50));
+                        }
+                        // By now every tracked thread (and any Metal init
+                        // any of them kicked off) has fully finished, so
+                        // this second exit is safe — both checks above
+                        // will read false and the default exit proceeds.
                         app_handle.exit(0);
                     });
                 }
@@ -2038,6 +2106,90 @@ mod engine_load_handle_tests {
         }
         let slot = Mutex::new(Some(handle));
         assert!(!engine_load_still_in_progress(&slot));
+    }
+}
+
+#[cfg(test)]
+mod active_gpu_work_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Steady state: nothing has ever called `begin_gpu_work`.
+    #[test]
+    fn zero_when_nothing_is_running() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+    }
+
+    /// The exact property the exit handler relies on: the counter is
+    /// nonzero for as long as the guard is alive, and drops back to zero
+    /// the instant it's dropped — proving this is real RAII, not a
+    /// counter that only increments.
+    #[test]
+    fn the_counter_is_nonzero_only_while_a_guard_is_alive() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        {
+            let _guard = begin_gpu_work(&counter);
+            assert_eq!(counter.load(Ordering::SeqCst), 1);
+        }
+        assert_eq!(counter.load(Ordering::SeqCst), 0, "dropping the guard must decrement back to zero");
+    }
+
+    /// The real-world shape: `stop_recording`, `reprocess_meeting_with_
+    /// speaker_count`, and orphan recovery can all have processing threads
+    /// alive at once. The counter must reflect the true concurrent count,
+    /// not just "something is running" as a boolean — a single meeting
+    /// finishing must not tell the exit handler it's safe to quit while
+    /// two others are still mid-pipeline.
+    #[test]
+    fn multiple_concurrent_guards_are_all_counted_independently() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let g1 = begin_gpu_work(&counter);
+        let g2 = begin_gpu_work(&counter);
+        let g3 = begin_gpu_work(&counter);
+        assert_eq!(counter.load(Ordering::SeqCst), 3);
+
+        drop(g2);
+        assert_eq!(counter.load(Ordering::SeqCst), 2, "dropping one of three must leave exactly two");
+
+        drop(g1);
+        drop(g3);
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+    }
+
+    /// The property that actually matters for the crash this fix closes:
+    /// the guard must decrement even when the closure holding it returns
+    /// early (a DB-open failure, exactly like the real early `return` in
+    /// `stop_recording`'s and orphan recovery's spawned closures) — a
+    /// guard that only decremented on the "happy path" would leave the
+    /// counter permanently stuck above zero after any real-world error,
+    /// wedging the exit handler into waiting forever.
+    #[test]
+    fn the_guard_decrements_even_when_its_closure_returns_early() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        fn simulate_early_return(counter: &Arc<AtomicUsize>) {
+            let _guard = begin_gpu_work(counter);
+            return; // mirrors a real early `return` past an `Err` branch
+        }
+        simulate_early_return(&counter);
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+    }
+
+    /// Same guarantee, this time through an actual panic — Rust runs
+    /// `Drop` during unwinding, so even a thread that panics mid-pipeline
+    /// must not leave the counter stuck. Run in a real spawned thread so
+    /// the panic doesn't fail this test process itself.
+    #[test]
+    fn the_guard_decrements_even_if_its_thread_panics() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_for_thread = counter.clone();
+        let result = std::thread::spawn(move || {
+            let _guard = begin_gpu_work(&counter_for_thread);
+            panic!("simulated pipeline panic");
+        })
+        .join();
+        assert!(result.is_err(), "the spawned closure was expected to panic");
+        assert_eq!(counter.load(Ordering::SeqCst), 0, "the guard must still decrement during unwinding");
     }
 }
 
