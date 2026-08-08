@@ -51,6 +51,11 @@ base64 = "0.22"
 # the user's default browser without going through a Tauri command/AppHandle.
 open = "5.4.0"
 tauri-plugin-dialog = "2"
+# Already resolved transitively; added directly for calendar.rs's
+# fallback join-link extraction (a Google Meet/Zoom link sitting as
+# plain text in an Outlook event's body/location, since Graph's own
+# onlineMeeting.joinUrl is only populated for native Teams meetings).
+regex = "1"
 
 # MicMuteToggle (ISC-274). Declared under the desktop-only target rather
 # than plain `[dependencies]` because the crate itself is

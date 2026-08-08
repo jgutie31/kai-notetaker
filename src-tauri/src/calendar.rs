@@ -104,6 +104,17 @@ struct GraphOnlineMeeting {
 }
 
 #[derive(Debug, Deserialize)]
+struct GraphBody {
+    content: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphLocation {
+    #[serde(rename = "displayName")]
+    display_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct GraphEvent {
     id: String,
     subject: String,
@@ -113,6 +124,60 @@ struct GraphEvent {
     attendees: Vec<GraphAttendee>,
     #[serde(default, rename = "onlineMeeting")]
     online_meeting: Option<GraphOnlineMeeting>,
+    /// Graph returns this by default (no `$select` is used, so nothing
+    /// was ever excluding it) — it just wasn't read into this struct
+    /// until the fallback join-link scan below needed it.
+    #[serde(default)]
+    body: Option<GraphBody>,
+    #[serde(default)]
+    location: Option<GraphLocation>,
+}
+
+/// Finds a Google Meet or Zoom join link sitting as plain text inside an
+/// event's body or location, for when Graph's own `onlineMeeting.joinUrl`
+/// is empty — true for any meeting that wasn't created via Outlook's own
+/// "Teams Meeting" toggle, including a Google Meet invite that landed on
+/// a Microsoft calendar because the invitee's mailbox lives on Microsoft
+/// 365 (confirmed for kairoscompliance.com specifically: its MX record
+/// points at `mail.protection.outlook.com`, not Google).
+///
+/// `text` is Graph's raw `body.content`, which defaults to HTML — this
+/// deliberately does NOT strip tags first. The join link itself contains
+/// no HTML-special characters, so it survives intact inside an `href`
+/// attribute or between tags either way; stripping tags first would only
+/// add a way to corrupt the very substring being searched for.
+///
+/// Stops matching at the first character that cannot appear in a bare
+/// URL written inline in HTML/text — whitespace, `"`, `'`, `<`, or `&`
+/// (the start of an HTML entity like `&amp;`) — so a link immediately
+/// followed by a closing quote or tag resolves to the real join URL, not
+/// the URL plus trailing markup.
+///
+/// A `?query=string` is deliberately KEPT, not stripped: Zoom links often
+/// carry a real, load-bearing `?pwd=...` passcode parameter that a bare
+/// meeting ID cannot join without prompting for a password, so trimming
+/// at `?` universally would silently break exactly the links that need
+/// it most. Google Meet's own tracking `?hs=...` param is harmless
+/// baggage kept along for the same reason — there's no way to know from
+/// the URL shape alone which query string is essential and which is
+/// cosmetic, so the correct default is to keep it intact either way.
+fn extract_fallback_join_url(text: &str) -> Option<String> {
+    static PATTERN: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = PATTERN.get_or_init(|| {
+        // The zoom.us branch requires each subdomain label to end in an
+        // explicit dot (`(?:[a-zA-Z0-9-]+\.)*`) rather than allowing any
+        // run of domain-shaped characters directly before `zoom.us` —
+        // the difference matters: a permissive character class would
+        // also match "notzoom.us" (verified empirically before landing
+        // this pattern), since "not" contains only letters and directly
+        // precedes the literal "zoom.us". Requiring a dot boundary means
+        // "notzoom.us" has no valid subdomain-label split that produces
+        // "zoom.us" as the remainder, so it correctly does not match,
+        // while a real subdomain like "us02web.zoom.us" still does.
+        regex::Regex::new(r#"https://(?:meet\.google\.com|(?:[a-zA-Z0-9-]+\.)*zoom\.us)/[^\s"'<&]+"#)
+            .expect("static regex is valid")
+    });
+    re.find(text).map(|m| m.as_str().to_string())
 }
 
 #[derive(Debug, Deserialize)]
@@ -122,17 +187,29 @@ struct GraphEventList {
 
 impl From<GraphEvent> for UpcomingMeeting {
     fn from(e: GraphEvent) -> Self {
+        let GraphEvent { id, subject, start, end, attendees, online_meeting, body, location } = e;
+
+        // The native field wins whenever it's present — it's structured
+        // Graph data about an actual Teams meeting, strictly more
+        // trustworthy than a regex match against free-text body/location.
+        // The fallback only runs at all when there is nothing better.
+        let body_text = body.and_then(|b| b.content);
+        let location_text = location.and_then(|l| l.display_name);
+        let join_url = online_meeting
+            .and_then(|m| m.join_url)
+            .or_else(|| body_text.as_deref().and_then(extract_fallback_join_url))
+            .or_else(|| location_text.as_deref().and_then(extract_fallback_join_url));
+
         UpcomingMeeting {
-            id: e.id,
-            subject: e.subject,
-            start: e.start.date_time,
-            end: e.end.date_time,
-            attendees: e
-                .attendees
+            id,
+            subject,
+            start: start.date_time,
+            end: end.date_time,
+            attendees: attendees
                 .into_iter()
                 .map(|a| a.email_address.name.unwrap_or(a.email_address.address))
                 .collect(),
-            join_url: e.online_meeting.and_then(|m| m.join_url),
+            join_url,
         }
     }
 }
@@ -238,6 +315,40 @@ mod tests {
                 "end": { "dateTime": "2026-08-11T09:30:00.0000000", "timeZone": "UTC" },
                 "attendees": [],
                 "isOnlineMeeting": false
+            },
+            {
+                "id": "AAMkAGI2TG93AAA=_GoogleMeetInBody",
+                "subject": "External vendor sync (Google Meet invite forwarded to Outlook)",
+                "start": { "dateTime": "2026-08-12T16:00:00.0000000", "timeZone": "UTC" },
+                "end": { "dateTime": "2026-08-12T16:30:00.0000000", "timeZone": "UTC" },
+                "attendees": [],
+                "isOnlineMeeting": false,
+                "body": {
+                    "contentType": "html",
+                    "content": "<div>You have been invited.<br><a href=\"https://meet.google.com/abc-defg-hij?hs=122\">https://meet.google.com/abc-defg-hij</a><br>Or dial: (US) +1 555-555-0100</div>"
+                }
+            },
+            {
+                "id": "AAMkAGI2TG93AAA=_ZoomInLocation",
+                "subject": "Client kickoff",
+                "start": { "dateTime": "2026-08-13T13:00:00.0000000", "timeZone": "UTC" },
+                "end": { "dateTime": "2026-08-13T13:30:00.0000000", "timeZone": "UTC" },
+                "attendees": [],
+                "isOnlineMeeting": false,
+                "location": { "displayName": "Zoom: https://us02web.zoom.us/j/1234567890" }
+            },
+            {
+                "id": "AAMkAGI2TG93AAA=_NativeTeamsWinsOverBodyLink",
+                "subject": "Native Teams meeting whose body ALSO happens to mention a Meet link",
+                "start": { "dateTime": "2026-08-14T10:00:00.0000000", "timeZone": "UTC" },
+                "end": { "dateTime": "2026-08-14T10:30:00.0000000", "timeZone": "UTC" },
+                "attendees": [],
+                "isOnlineMeeting": true,
+                "onlineMeeting": { "joinUrl": "https://teams.microsoft.com/l/meetup-join/the-real-one" },
+                "body": {
+                    "contentType": "html",
+                    "content": "<div>Backup link if Teams is down: https://meet.google.com/zzz-zzzz-zzz</div>"
+                }
             }
         ]
     }"#;
@@ -247,7 +358,7 @@ mod tests {
         let list: GraphEventList = serde_json::from_str(REAL_SHAPED_GRAPH_RESPONSE).unwrap();
         let meetings: Vec<UpcomingMeeting> = list.value.into_iter().map(UpcomingMeeting::from).collect();
 
-        assert_eq!(meetings.len(), 2);
+        assert_eq!(meetings.len(), 5);
         // The Graph Event's own stable primary key — load-bearing for
         // idempotent auto-join tracking (ISC-159/ISC-161). Asserted as a
         // real value, not just non-empty, so a silently-renamed field
@@ -264,6 +375,98 @@ mod tests {
 
         assert_eq!(meetings[1].attendees, Vec::<String>::new());
         assert_eq!(meetings[1].join_url, None, "no onlineMeeting field at all must not error, just resolve to None");
+    }
+
+    /// The exact real-world case this feature exists for (Jeremiah's own
+    /// request, 2026-08-07): a Google Meet invite that lands on his
+    /// kairoscompliance.com/Microsoft 365 calendar — confirmed via that
+    /// domain's real MX record pointing at Outlook, not Google — has no
+    /// native `onlineMeeting.joinUrl` at all, only the link sitting as
+    /// plain HTML text in the event body. Must resolve to a working join
+    /// URL — trailing HTML markup stripped, but the query string kept
+    /// (see `extract_fallback_join_url`'s own doc comment for why). The
+    /// fixture's `href` attribute is what's matched, since it appears
+    /// before the visible link text in the raw HTML and `find` takes the
+    /// leftmost match.
+    #[test]
+    fn a_google_meet_link_in_the_event_body_becomes_the_join_url() {
+        let list: GraphEventList = serde_json::from_str(REAL_SHAPED_GRAPH_RESPONSE).unwrap();
+        let meetings: Vec<UpcomingMeeting> = list.value.into_iter().map(UpcomingMeeting::from).collect();
+        let meeting = meetings.iter().find(|m| m.id == "AAMkAGI2TG93AAA=_GoogleMeetInBody").unwrap();
+        assert_eq!(meeting.join_url, Some("https://meet.google.com/abc-defg-hij?hs=122".to_string()));
+    }
+
+    /// Location, not just body — the same fallback covers whichever field
+    /// the link actually ended up in. Zoom, not just Google Meet, since
+    /// the identical gap already existed for Zoom links in Outlook bodies
+    /// before this fix (see the `SkipNoJoinUrl` test in `auto_join.rs`).
+    #[test]
+    fn a_zoom_link_in_the_event_location_becomes_the_join_url() {
+        let list: GraphEventList = serde_json::from_str(REAL_SHAPED_GRAPH_RESPONSE).unwrap();
+        let meetings: Vec<UpcomingMeeting> = list.value.into_iter().map(UpcomingMeeting::from).collect();
+        let meeting = meetings.iter().find(|m| m.id == "AAMkAGI2TG93AAA=_ZoomInLocation").unwrap();
+        assert_eq!(meeting.join_url, Some("https://us02web.zoom.us/j/1234567890".to_string()));
+    }
+
+    /// The native Graph field must win even when the body also contains a
+    /// link — a real native Teams meeting is strictly more trustworthy
+    /// than a regex match against free text, and must never be displaced
+    /// by an unrelated backup link someone pasted into the description.
+    #[test]
+    fn the_native_teams_join_url_wins_over_any_link_in_the_body() {
+        let list: GraphEventList = serde_json::from_str(REAL_SHAPED_GRAPH_RESPONSE).unwrap();
+        let meetings: Vec<UpcomingMeeting> = list.value.into_iter().map(UpcomingMeeting::from).collect();
+        let meeting = meetings.iter().find(|m| m.id == "AAMkAGI2TG93AAA=_NativeTeamsWinsOverBodyLink").unwrap();
+        assert_eq!(meeting.join_url, Some("https://teams.microsoft.com/l/meetup-join/the-real-one".to_string()));
+    }
+
+    /// `extract_fallback_join_url` in isolation — no Graph JSON, no
+    /// deserialization, just the pure text-scanning logic.
+    mod extract_fallback_join_url_tests {
+        use super::*;
+
+        #[test]
+        fn finds_a_google_meet_link_inside_an_html_anchor_tags_href_attribute() {
+            let html = r#"<a href="https://meet.google.com/abc-defg-hij?hs=122">join</a>"#;
+            // The query string is real (Google's own handshake param) and
+            // deliberately kept — see the function's doc comment.
+            assert_eq!(extract_fallback_join_url(html), Some("https://meet.google.com/abc-defg-hij?hs=122".to_string()));
+        }
+
+        #[test]
+        fn stops_at_a_closing_quote_so_the_href_attribute_boundary_never_leaks_in() {
+            let html = r#"before <a href="https://meet.google.com/abc-defg-hij">text</a> after"#;
+            assert_eq!(extract_fallback_join_url(html), Some("https://meet.google.com/abc-defg-hij".to_string()));
+        }
+
+        #[test]
+        fn stops_at_an_html_entity_ampersand_on_a_tracking_query_param() {
+            // Graph's HTML body encodes a literal `&` in a query string as
+            // `&amp;` — the match must stop at the entity, not swallow it.
+            let html = "https://meet.google.com/abc-defg-hij&amp;extra=1";
+            assert_eq!(extract_fallback_join_url(html), Some("https://meet.google.com/abc-defg-hij".to_string()));
+        }
+
+        #[test]
+        fn finds_a_zoom_link_with_a_regional_subdomain() {
+            let text = "Join: https://us02web.zoom.us/j/1234567890 or dial in";
+            assert_eq!(extract_fallback_join_url(text), Some("https://us02web.zoom.us/j/1234567890".to_string()));
+        }
+
+        #[test]
+        fn returns_none_when_no_recognized_link_is_present() {
+            assert_eq!(extract_fallback_join_url("Conference Room B, 3rd floor"), None);
+            assert_eq!(extract_fallback_join_url(""), None);
+        }
+
+        #[test]
+        fn does_not_match_an_unrelated_domain_that_merely_contains_zoom_as_a_substring() {
+            // "notzoom.us" must not be mistaken for zoom.us — the pattern
+            // requires "zoom.us" to be the actual registrable domain
+            // (anything before it ends in a dot), not merely a substring
+            // anywhere in the host.
+            assert_eq!(extract_fallback_join_url("https://notzoom.us/j/123"), None);
+        }
     }
 
     // Real HTTP GET over loopback against a fake (but Graph-shaped) server —
