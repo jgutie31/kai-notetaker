@@ -7,6 +7,7 @@ mod audio_capture;
 pub mod audit_log;
 mod auto_join;
 mod calendar;
+mod call_mute;
 mod cloud_sync_gate;
 pub mod diarization;
 pub mod embeddings;
@@ -397,6 +398,15 @@ fn toggle_mic_mute_inner(app: &tauri::AppHandle) -> Result<bool, String> {
         // frontend listener's follow-up command deadlock against it.
     };
 
+    // TeamsCallMuteSync (ISC-281). Placed here, after the lock is
+    // dropped, for the same reason the emit below is: shelling out to
+    // `pgrep` and talking to CoreGraphics while holding the recording
+    // lock would block every other recording-state caller on an
+    // unbounded external process.
+    //
+    // Best-effort by construction — see the function's own contract.
+    sync_teams_call_mute();
+
     if let Err(e) = app.emit(MIC_MUTE_CHANGED_EVENT, MicMuteChangedPayload { muted: new_muted }) {
         // Logged, not fatal, and deliberately NOT rolled back: the audio
         // gate has already changed, which is the part that matters. The
@@ -406,11 +416,82 @@ fn toggle_mic_mute_inner(app: &tauri::AppHandle) -> Result<bool, String> {
     Ok(new_muted)
 }
 
+/// Microsoft Teams' executable name, as `pgrep -x` sees it.
+///
+/// Read off `CFBundleExecutable` in the installed `/Applications/Microsoft
+/// Teams.app/Contents/Info.plist`, not guessed. The bundle identifier
+/// (`com.microsoft.teams2`) is deliberately NOT used — `pgrep` matches
+/// process names, and passing a bundle id would silently never match.
+const TEAMS_EXECUTABLE_NAME: &str = "MSTeams";
+
+/// Ensures the Accessibility-permission remedy is printed at most once per
+/// app run, not once per toggle. A user who has not granted it will hit
+/// this on every single mute press for the whole meeting; repeating the
+/// same paragraph dozens of times buries it instead of surfacing it.
+static ACCESSIBILITY_WARNING: std::sync::Once = std::sync::Once::new();
+
+/// Mirror the mute toggle onto the real Teams call by posting Teams' own
+/// mute shortcut into Teams' process (ISC-281, ISC-282).
+///
+/// **Returns `()` on purpose.** This is the failure isolation, expressed
+/// in the type rather than in a comment asking the caller to be careful:
+/// there is no error value for `toggle_mic_mute_inner` to accidentally
+/// propagate with `?`, so no future edit can make a Teams-side problem
+/// fail the toggle. By the time this runs, `set_mic_muted` has already
+/// succeeded — the recording-side gate is the part that must never be
+/// held hostage to whether Teams is open or whether an OS permission
+/// Jeremiah has not granted yet happens to be in place.
+///
+/// Teams not running is a silent no-op, not a warning: most recordings
+/// have no Teams at all (in-person meetings, testing the button on its
+/// own), and logging that as a problem would train the log to be ignored.
+///
+/// Sends Cmd+Shift+M — Teams' own mute shortcut — which is deliberately a
+/// DIFFERENT combo from kai-notetaker's own Cmd+Option+M hotkey, so the
+/// keystroke this posts can never be mistaken for, or re-trigger, the
+/// hotkey that caused it.
+fn sync_teams_call_mute() {
+    let Some(pid) = call_mute::find_running_pid(TEAMS_EXECUTABLE_NAME) else {
+        // Teams isn't running. Ordinary, not an error.
+        return;
+    };
+
+    if !call_mute::accessibility_permission_granted() {
+        ACCESSIBILITY_WARNING.call_once(|| {
+            eprintln!(
+                "mic mute: Teams is running, but kai-notetaker does not have Accessibility \
+                 permission, so it cannot mute the actual call — only its own recording. \
+                 To fix: System Settings -> Privacy & Security -> Accessibility, then enable \
+                 kai-notetaker (add it with + if it isn't listed) and restart the app."
+            );
+        });
+        // Deliberately falls through and still attempts the post. The
+        // check is a diagnostic, not a gate: AXIsProcessTrusted can read
+        // stale right after the user grants permission, and refusing to
+        // try would turn a recoverable state into a hard failure.
+    }
+
+    if let Err(e) = call_mute::post_key_combo_to_pid(
+        pid,
+        core_graphics::event::KeyCode::ANSI_M,
+        core_graphics::event::CGEventFlags::CGEventFlagCommand
+            | core_graphics::event::CGEventFlags::CGEventFlagShift,
+    ) {
+        // Swallowed by design — see this function's return type.
+        eprintln!("mic mute: failed to post mute shortcut to Teams (pid {pid}): {e}");
+    }
+}
+
 /// Flip kai-notetaker's own mic capture between recording real audio and
 /// recording silence, returning the new state (ISC-273).
 ///
-/// This is independent of Teams/Zoom/Meet's own mute — it changes only
-/// what this app writes to disk, never what the call hears.
+/// As of TeamsCallMuteSync (ISC-281) this ALSO mutes the real Microsoft
+/// Teams call when Teams is running — the two are no longer independent,
+/// which was the whole point of Phase 2. The Teams half is best-effort:
+/// it never blocks, never rolls back, and never fails this command.
+///
+/// Teams specifically. Other conferencing apps are untouched, so for
+/// those this remains a recording-side gate only.
 #[tauri::command]
 fn toggle_mic_mute(app: tauri::AppHandle) -> Result<bool, String> {
     toggle_mic_mute_inner(&app)
