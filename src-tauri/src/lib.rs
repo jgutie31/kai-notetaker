@@ -34,6 +34,15 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tauri::{Manager, State};
 
+// Raw libc `_exit` — terminates immediately, skipping atexit/global C++
+// destructors (unlike `std::process::exit`, which still runs them). Every
+// Rust binary already links libSystem on macOS, so no new dependency is
+// needed for this one symbol. See the quit handler in `run` for why this
+// is required over the standard exit path.
+unsafe extern "C" {
+    fn _exit(status: i32) -> !;
+}
+
 /// Holds the in-progress recording (if any) across separate command
 /// invocations from the frontend (start → ... → stop are two distinct
 /// calls). `cpal::Stream` is confirmed `Send + Sync` on macOS via the
@@ -1957,37 +1966,49 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app_handle, event| {
-            // ISC (crash fix, 2026-08-07, generalized same day after a
-            // second real crash): never let the process's normal exit
-            // proceed while EITHER the initial model-loading thread OR any
-            // per-meeting pipeline-processing thread is still in flight —
-            // see `EngineLoadHandle`'s and `ActiveGpuWork`'s doc comments
-            // for the exact race this closes. The common case (nothing in
-            // flight) costs two non-blocking checks and nothing else.
+            // ISC (crash fix, 2026-08-07, then widened 2026-08-07 after a
+            // THIRD real crash on a completely idle app): the earlier fix
+            // only guarded the race where exit landed mid model-load or
+            // mid pipeline-processing. But ggml's Metal backend aborts
+            // inside its own C++ static destructor whenever the process
+            // runs the *normal* libc exit()/atexit chain — Cocoa's
+            // -[NSApplication terminate:] always ends by calling exit(),
+            // which unwinds every registered global destructor including
+            // ggml_metal_device's, and that destructor calls
+            // ggml_abort() unconditionally once a Metal device has ever
+            // been initialized. That fires on an ordinary, idle quit too,
+            // not just an in-flight one — Jeremiah's "I did nothing, just
+            // reopened it" crash proved that.
+            //
+            // There is nothing worth saving by letting that teardown run:
+            // the kernel reclaims GPU/file handles on process death either
+            // way. So every quit now drains any real in-flight work first
+            // (unchanged from the original fix, so a recording write or
+            // model load never gets yanked mid-flight), then terminates
+            // via a raw `_exit`, which skips atexit/global destructors
+            // entirely and can never reach the aborting code.
             if let tauri::RunEvent::ExitRequested { api, .. } = event {
+                api.prevent_exit();
                 let load_handle = app_handle.state::<EngineLoadHandle>().0.clone();
                 let active_gpu_work = app_handle.state::<ActiveGpuWork>().0.clone();
-                let still_loading = engine_load_still_in_progress(&load_handle);
-                let processing = active_gpu_work.load(std::sync::atomic::Ordering::SeqCst) > 0;
-                if still_loading || processing {
-                    api.prevent_exit();
-                    let app_handle = app_handle.clone();
-                    std::thread::spawn(move || {
-                        if let Some(handle) = load_handle.lock().unwrap().take() {
-                            let _ = handle.join();
-                        }
-                        // Can't "join" a counter — poll until every
-                        // in-flight processing thread's guard has dropped.
-                        while active_gpu_work.load(std::sync::atomic::Ordering::SeqCst) > 0 {
-                            std::thread::sleep(std::time::Duration::from_millis(50));
-                        }
-                        // By now every tracked thread (and any Metal init
-                        // any of them kicked off) has fully finished, so
-                        // this second exit is safe — both checks above
-                        // will read false and the default exit proceeds.
-                        app_handle.exit(0);
-                    });
-                }
+                std::thread::spawn(move || {
+                    if let Some(handle) = load_handle.lock().unwrap().take() {
+                        let _ = handle.join();
+                    }
+                    // Can't "join" a counter — poll until every
+                    // in-flight processing thread's guard has dropped.
+                    while active_gpu_work.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
+                    // SAFETY: `_exit` is libc's immediate-termination call —
+                    // no arguments to violate, no return to race against.
+                    // Deliberately bypassing `std::process::exit`/Tauri's
+                    // `app_handle.exit`, both of which still route through
+                    // libc `exit()` and the crashing destructor chain above.
+                    unsafe {
+                        _exit(0);
+                    }
+                });
             }
         });
 }
